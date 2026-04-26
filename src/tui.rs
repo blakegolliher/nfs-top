@@ -85,7 +85,7 @@ fn run_loop(
                     KeyCode::Char('?') => app.tab = Tab::Help,
                     KeyCode::Char(' ') => app.paused = !app.paused,
                     KeyCode::Char('r') => app.reset_baseline(),
-                    KeyCode::Char('s') => app.sort = app.sort.next(),
+                    KeyCode::Char('s') => app.cycle_sort(),
                     KeyCode::Char('p') => app.percentile_mode = app.percentile_mode.next(),
                     KeyCode::Char('a') => app.units = UnitsMode::Auto,
                     KeyCode::Char('m') => app.units = UnitsMode::MiB,

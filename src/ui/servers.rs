@@ -32,10 +32,10 @@ pub fn draw(f: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
         };
 
     let srv = app.selected_server();
-    let read_val = srv.as_ref().map(|s| fmt_rate(s.read_bps, app.units)).unwrap_or_else(|| "-".into());
-    let write_val = srv.as_ref().map(|s| fmt_rate(s.write_bps, app.units)).unwrap_or_else(|| "-".into());
-    let ops_val = srv.as_ref().map(|s| format!("{:.1}", s.ops_per_sec)).unwrap_or_else(|| "-".into());
-    let rtt_val = srv.as_ref().map(|s| fmt_ms(s.avg_rtt_ms)).unwrap_or_else(|| "-".into());
+    let read_val = srv.map(|s| fmt_rate(s.read_bps, app.units)).unwrap_or_else(|| "-".into());
+    let write_val = srv.map(|s| fmt_rate(s.write_bps, app.units)).unwrap_or_else(|| "-".into());
+    let ops_val = srv.map(|s| format!("{:.1}", s.ops_per_sec)).unwrap_or_else(|| "-".into());
+    let rtt_val = srv.map(|s| fmt_ms(s.avg_rtt_ms)).unwrap_or_else(|| "-".into());
 
     draw_line_card(f, top[0], "Read Throughput", &read_series, &read_val, ACCENT_A);
     draw_line_card(f, top[1], "Write Throughput", &write_series, &write_val, ACCENT_B);
@@ -91,7 +91,7 @@ pub fn draw(f: &mut Frame<'_>, area: ratatui::layout::Rect, app: &App) {
     f.render_widget(table, middle[0]);
 
     // Detail panel
-    let details = if let Some(s) = srv.as_ref() {
+    let details = if let Some(s) = srv {
         let mounts_str = if s.mounts.is_empty() {
             "-".to_string()
         } else {

@@ -134,7 +134,7 @@ fn derive_rates(
     let mut ops_per_sec = 0.0;
     let mut rtt_sum = 0.0;
     let mut exe_sum = 0.0;
-    let mut cnt = 0.0;
+    let mut cnt: usize = 0;
     let mut per_op = Vec::new();
     let mut total_delta_calls = 0u64;
 
@@ -165,7 +165,7 @@ fn derive_rates(
         if delta_calls > 0 {
             rtt_sum += delta_rtt / delta_calls as f64;
             exe_sum += delta_exe / delta_calls as f64;
-            cnt += 1.0;
+            cnt += 1;
         }
 
         per_op.push(OpDerived {
@@ -188,8 +188,8 @@ fn derive_rates(
         read_bps,
         write_bps,
         ops_per_sec,
-        avg_rtt_ms: (cnt > 0.0).then_some(rtt_sum / cnt),
-        avg_exe_ms: (cnt > 0.0).then_some(exe_sum / cnt),
+        avg_rtt_ms: (cnt > 0).then(|| rtt_sum / cnt as f64),
+        avg_exe_ms: (cnt > 0).then(|| exe_sum / cnt as f64),
         observed_conns,
         observed_by_ip,
         per_op,
@@ -204,19 +204,11 @@ fn fallback<T: Default>(label: &str, errors: &mut Vec<String>, r: Result<T>) -> 
 }
 
 fn delta_u64(prev: Option<u64>, curr: u64) -> u64 {
-    match prev {
-        Some(p) if curr >= p => curr - p,
-        Some(_) => 0,
-        None => 0,
-    }
+    prev.map_or(0, |p| curr.saturating_sub(p))
 }
 
 fn delta_f64(prev: Option<f64>, curr: f64) -> f64 {
-    match prev {
-        Some(p) if curr >= p => curr - p,
-        Some(_) => 0.0,
-        None => 0.0,
-    }
+    prev.map_or(0.0, |p| (curr - p).max(0.0))
 }
 
 #[cfg(test)]
