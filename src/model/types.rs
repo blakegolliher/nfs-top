@@ -141,6 +141,11 @@ pub struct Snapshot {
     pub rpc: RpcClientCounters,
     pub raw_tcp_matches: Vec<String>,
     pub partial_errors: Vec<String>,
+    /// Optional eBPF-derived latency for this interval, aggregated across
+    /// all NFS mounts. None means the eBPF backend is disabled, did not
+    /// load, or produced no samples since the last tick. Per-mount split
+    /// requires s_dev tagging and lands in a follow-up.
+    pub bpf: Option<BpfLatency>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

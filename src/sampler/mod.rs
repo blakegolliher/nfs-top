@@ -14,6 +14,7 @@ use crate::model::types::{MountCounters, MountDerived, MountView, OpDerived, Sna
 pub mod dns;
 #[cfg(feature = "ebpf")]
 pub mod ebpf;
+pub mod hist;
 pub mod mounts;
 pub mod mountstats;
 pub mod rpc;
@@ -31,6 +32,15 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
     thread::spawn(move || {
         let mut prev: Option<(SystemTime, Vec<MountCounters>)> = None;
         let mut dns_cache = dns::DnsCache::new(Duration::from_secs(60));
+
+        #[cfg(feature = "ebpf")]
+        let mut enricher: Option<ebpf::Enricher> = match ebpf::Enricher::try_new() {
+            Ok(e) => Some(e),
+            Err(e) => {
+                eprintln!("nfs-top: eBPF latency disabled: {e:#}");
+                None
+            }
+        };
 
         loop {
             let now = SystemTime::now();
@@ -103,6 +113,21 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
             }
 
             let prev_counters = views.iter().map(|v| v.counters.clone()).collect::<Vec<_>>();
+
+            #[cfg(feature = "ebpf")]
+            let bpf = match enricher.as_mut() {
+                Some(e) => match e.snapshot() {
+                    Ok(b) => b,
+                    Err(err) => {
+                        partial_errors.push(format!("ebpf: {err:#}"));
+                        None
+                    }
+                },
+                None => None,
+            };
+            #[cfg(not(feature = "ebpf"))]
+            let bpf: Option<crate::model::types::BpfLatency> = None;
+
             let snap = Snapshot {
                 ts: now,
                 dt_secs,
@@ -110,6 +135,7 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
                 rpc,
                 raw_tcp_matches: sockets.raw_matches,
                 partial_errors,
+                bpf,
             };
 
             let _ = tx.send(Ok(snap));

@@ -19,9 +19,13 @@ mod skel {
 }
 
 use libbpf_rs::skel::{OpenSkel, Skel, SkelBuilder};
-use libbpf_rs::OpenObject;
+use libbpf_rs::{MapCore, MapFlags, OpenObject};
+use std::collections::HashMap;
 use std::mem::MaybeUninit;
 use skel::{NfsLatSkel, NfsLatSkelBuilder};
+
+use crate::model::types::{BpfLatency, BpfOpLatency, LatencyDist};
+use crate::sampler::hist::{self, BUCKETS};
 
 /// Op identifiers, in lockstep with `enum nfs_op_id` in src/bpf/nfs_lat.bpf.h.
 pub const OP_OTHER: u16 = 0;
@@ -44,7 +48,11 @@ pub fn op_name(id: u16) -> &'static str {
 /// internal references remain valid for the lifetime of `Enricher`.
 pub struct Enricher {
     _open_object: Box<MaybeUninit<OpenObject>>,
-    _skel: NfsLatSkel<'static>,
+    skel: NfsLatSkel<'static>,
+    /// Last-seen absolute count for every (op_id, bucket) we've ever
+    /// observed in the kernel `hist` map. Used to compute per-tick deltas
+    /// without resetting the map (snapshot-and-diff).
+    prev: HashMap<(u16, u16), u64>,
 }
 
 impl Enricher {
@@ -66,7 +74,70 @@ impl Enricher {
         loaded.attach().context("attaching BPF tracepoints")?;
         Ok(Self {
             _open_object: open_object,
-            _skel: loaded,
+            skel: loaded,
+            prev: HashMap::new(),
         })
+    }
+
+    /// Walk the kernel `hist` map, diff against the previous snapshot, and
+    /// fold the per-tick deltas into a `BpfLatency`. Returns `None` if no
+    /// op saw any new samples this tick.
+    pub fn snapshot(&mut self) -> Result<Option<BpfLatency>> {
+        let map = &self.skel.maps.hist;
+        let mut per_op: HashMap<u16, [u64; BUCKETS]> = HashMap::new();
+        let mut total_samples: u64 = 0;
+
+        for key_bytes in MapCore::keys(map) {
+            let Some(val) = MapCore::lookup(map, &key_bytes, MapFlags::ANY)? else {
+                continue;
+            };
+            if key_bytes.len() < 4 || val.len() < 8 {
+                continue;
+            }
+            let op_id = u16::from_ne_bytes([key_bytes[0], key_bytes[1]]);
+            let bucket = u16::from_ne_bytes([key_bytes[2], key_bytes[3]]);
+            let curr = u64::from_ne_bytes(val[..8].try_into().unwrap());
+            let entry = self.prev.entry((op_id, bucket)).or_insert(0);
+            let delta = curr.saturating_sub(*entry);
+            *entry = curr;
+            if delta == 0 {
+                continue;
+            }
+            let bucket = (bucket as usize).min(BUCKETS - 1);
+            per_op.entry(op_id).or_insert([0u64; BUCKETS])[bucket] += delta;
+            total_samples = total_samples.saturating_add(delta);
+        }
+
+        if per_op.is_empty() {
+            return Ok(None);
+        }
+
+        let mut out: Vec<BpfOpLatency> = per_op
+            .into_iter()
+            .map(|(op_id, buckets)| BpfOpLatency {
+                op: op_name(op_id).to_string(),
+                dist: dist_from_buckets(&buckets),
+            })
+            .collect();
+        out.sort_by(|a, b| b.dist.samples.cmp(&a.dist.samples));
+
+        Ok(Some(BpfLatency {
+            per_op: out,
+            total_samples,
+        }))
+    }
+}
+
+fn dist_from_buckets(buckets: &[u64; BUCKETS]) -> LatencyDist {
+    let samples = hist::total(buckets);
+    LatencyDist {
+        samples,
+        p50_ns: hist::percentile_ns(buckets, samples, 0.50),
+        p90_ns: hist::percentile_ns(buckets, samples, 0.90),
+        p99_ns: hist::percentile_ns(buckets, samples, 0.99),
+        p999_ns: hist::percentile_ns(buckets, samples, 0.999),
+        p9999_ns: hist::percentile_ns(buckets, samples, 0.9999),
+        p99999_ns: hist::percentile_ns(buckets, samples, 0.99999),
+        max_ns: hist::max_ns(buckets),
     }
 }
