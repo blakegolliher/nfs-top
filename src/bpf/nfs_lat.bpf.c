@@ -1,11 +1,22 @@
 /*
  * nfs-top eBPF latency probes.
  *
- * v0 scaffold: defines the histogram and in-flight maps and a stub
- * raw_tracepoint program so the skeleton loads and the verifier accepts
- * the maps. Real probes (nfs_initiate_read/done, write, commit) land in
- * the next commit. Keeping this commit minimal lets the Rust build chain
- * + libbpf-cargo + clang BPF target be validated in isolation.
+ * Pairs raw_tracepoint probes at the NFS-client layer to measure
+ * per-op latency in log2-ns buckets. Userspace folds the histograms
+ * into MountDerived.bpf alongside the existing /proc-derived counters;
+ * this code never replaces the /proc path.
+ *
+ * Probes (fire on both NFSv3 and NFSv4 read/write/commit paths):
+ *   nfs_initiate_read   / nfs_readpage_done    -> OP_READ
+ *   nfs_initiate_write  / nfs_writeback_done   -> OP_WRITE
+ *   nfs_initiate_commit / nfs_commit_done      -> OP_COMMIT
+ *
+ * In-flight key: pointer to nfs_pgio_header (read/write) or
+ * nfs_commit_data (commit), which is stable across the init/done pair.
+ * No struct-field dereferences in v0, so no module BTF dependency.
+ *
+ * Histogram key: (op_id, log2(latency_ns)). Userspace deltas the
+ * counts each tick (snapshot-and-diff), no map reset.
  */
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
@@ -14,8 +25,6 @@
 
 char LICENSE[] SEC("license") = "GPL";
 
-/* Histogram of latency: (op_id, log2_bucket) -> count.
- * Cardinality bound: NFS_OP_MAX * ~30 active buckets = ~120 entries. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 1024);
@@ -23,9 +32,6 @@ struct {
 	__type(value, __u64);
 } hist SEC(".maps");
 
-/* In-flight bookkeeping, keyed by the request pointer (e.g.
- * struct nfs_pgio_header *) which uniquely identifies an op between
- * its initiate and its done tracepoint. */
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
 	__uint(max_entries, 65536);
@@ -33,11 +39,80 @@ struct {
 	__type(value, struct inflight_val);
 } inflight SEC(".maps");
 
-/* Stub program. Attached to a tracepoint that always exists so the
- * skeleton loads cleanly during scaffolding. The body is intentionally
- * empty — replaced by real NFS probes in the next commit. */
-SEC("raw_tracepoint/sys_enter")
-int handle_stub(void *ctx)
+/* floor(log2(ns)) capped at 63. Caller guarantees ns >= 1. */
+static __always_inline __u16 log2_bucket(__u64 ns)
 {
+	if (ns < 2)
+		return 0;
+	return 63 - __builtin_clzll(ns);
+}
+
+static __always_inline int record_start(__u64 key, __u16 op_id)
+{
+	struct inflight_val v = {};
+	v.ts_ns = bpf_ktime_get_ns();
+	v.op_id = op_id;
+	bpf_map_update_elem(&inflight, &key, &v, BPF_ANY);
 	return 0;
+}
+
+static __always_inline int record_done(__u64 key)
+{
+	struct inflight_val *v = bpf_map_lookup_elem(&inflight, &key);
+	if (!v)
+		return 0;
+
+	__u64 lat = bpf_ktime_get_ns() - v->ts_ns;
+	struct hist_key hk = {
+		.op_id = v->op_id,
+		.bucket = log2_bucket(lat),
+	};
+	__u64 *cnt = bpf_map_lookup_elem(&hist, &hk);
+	if (cnt) {
+		__sync_fetch_and_add(cnt, 1);
+	} else {
+		__u64 one = 1;
+		bpf_map_update_elem(&hist, &hk, &one, BPF_NOEXIST);
+	}
+	bpf_map_delete_elem(&inflight, &key);
+	return 0;
+}
+
+/* Read: init has 1 arg (hdr); done has 2 args (task, hdr). */
+SEC("raw_tracepoint/nfs_initiate_read")
+int handle_read_init(struct bpf_raw_tracepoint_args *ctx)
+{
+	return record_start(ctx->args[0], OP_READ);
+}
+
+SEC("raw_tracepoint/nfs_readpage_done")
+int handle_read_done(struct bpf_raw_tracepoint_args *ctx)
+{
+	return record_done(ctx->args[1]);
+}
+
+/* Write: init has 1 arg (hdr); done has 3 args (task, hdr, status). */
+SEC("raw_tracepoint/nfs_initiate_write")
+int handle_write_init(struct bpf_raw_tracepoint_args *ctx)
+{
+	return record_start(ctx->args[0], OP_WRITE);
+}
+
+SEC("raw_tracepoint/nfs_writeback_done")
+int handle_write_done(struct bpf_raw_tracepoint_args *ctx)
+{
+	return record_done(ctx->args[1]);
+}
+
+/* Commit: init has 1 arg (data); done has 2 args (task, data). */
+SEC("raw_tracepoint/nfs_initiate_commit")
+int handle_commit_init(struct bpf_raw_tracepoint_args *ctx)
+{
+	return record_start(ctx->args[0], OP_COMMIT);
+}
+
+SEC("raw_tracepoint/nfs_commit_done")
+int handle_commit_done(struct bpf_raw_tracepoint_args *ctx)
+{
+	return record_done(ctx->args[1]);
 }
