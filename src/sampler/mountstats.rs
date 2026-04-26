@@ -14,19 +14,28 @@ pub fn read_mountstats() -> Result<Vec<MountCounters>> {
 }
 
 pub fn parse_mountstats(input: &str) -> Result<Vec<MountCounters>> {
+    // Track each mount's block as a byte-range slice into `input` instead of
+    // collecting owned String lines and re-joining them. The original code
+    // allocated O(lines) Strings per tick on a host with many mounts.
     let mut out = Vec::new();
-    let mut block = Vec::new();
+    let mut block_start: Option<usize> = None;
+    let mut offset = 0usize;
 
-    for line in input.lines() {
-        if line.starts_with("device ") && !block.is_empty() {
-            if let Some(m) = parse_block(&block.join("\n")) {
+    for line_with_term in input.split_inclusive('\n') {
+        let line = line_with_term.strip_suffix('\n').unwrap_or(line_with_term);
+        if line.starts_with("device ") {
+            if let Some(start) = block_start
+                && let Some(m) = parse_block(&input[start..offset])
+            {
                 out.push(m);
             }
-            block.clear();
+            block_start = Some(offset);
         }
-        block.push(line.to_string());
+        offset += line_with_term.len();
     }
-    if !block.is_empty() && let Some(m) = parse_block(&block.join("\n")) {
+    if let Some(start) = block_start
+        && let Some(m) = parse_block(&input[start..])
+    {
         out.push(m);
     }
 
