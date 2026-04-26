@@ -101,6 +101,7 @@ pub struct Snapshot {
     pub mounts: Vec<MountView>,
     pub rpc: RpcClientCounters,
     pub raw_tcp_matches: Vec<String>,
+    pub partial_errors: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

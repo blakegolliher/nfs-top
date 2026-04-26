@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 use std::net::IpAddr;
@@ -13,8 +13,10 @@ pub struct SocketObs {
 
 pub fn read_observed_nfs(remote_ports: &[u16]) -> Result<SocketObs> {
     let mut out = SocketObs::default();
-    parse_tcp_lines(&fs::read_to_string("/proc/net/tcp")?, false, remote_ports, &mut out);
-    parse_tcp_lines(&fs::read_to_string("/proc/net/tcp6")?, true, remote_ports, &mut out);
+    let v4 = fs::read_to_string("/proc/net/tcp").context("reading /proc/net/tcp")?;
+    parse_tcp_lines(&v4, false, remote_ports, &mut out);
+    let v6 = fs::read_to_string("/proc/net/tcp6").context("reading /proc/net/tcp6")?;
+    parse_tcp_lines(&v6, true, remote_ports, &mut out);
     Ok(out)
 }
 
