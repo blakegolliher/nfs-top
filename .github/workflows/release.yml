@@ -50,26 +50,26 @@ jobs:
               # ---------- rpm ----------
               RPMTMP=$(mktemp -d)
               mkdir -p "$RPMTMP/rpmbuild"/{BUILD,RPMS,SRPMS,SOURCES,SPECS}
-              cat > "$RPMTMP/nfs-top.spec" <<EOF
-Name:        nfs-top
-Version:     ${VERSION}
-Release:     1
-Summary:     Real-time NFS client monitor (bandwidth, IOPS, latency)
-License:     MIT
-URL:         https://github.com/blakegolliher/nfs-top
-BuildArch:   x86_64
-
-%description
-nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads
-/proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and
-optionally enriches per-op latency from kernel-side eBPF probes,
-rendering a live dashboard of per-mount throughput, ops, and latency.
-
-%files
-%attr(0755,root,root) /usr/local/bin/nfs-top
-%doc /usr/local/share/doc/nfs-top/README.md
-%license /usr/local/share/doc/nfs-top/LICENSE
-EOF
+              printf "%s\n" \
+                "Name:        nfs-top" \
+                "Version:     $VERSION" \
+                "Release:     1" \
+                "Summary:     Real-time NFS client monitor (bandwidth, IOPS, latency)" \
+                "License:     MIT" \
+                "URL:         https://github.com/blakegolliher/nfs-top" \
+                "BuildArch:   x86_64" \
+                "" \
+                "%description" \
+                "nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads" \
+                "/proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and" \
+                "optionally enriches per-op latency from kernel-side eBPF probes," \
+                "rendering a live dashboard of per-mount throughput, ops, and latency." \
+                "" \
+                "%files" \
+                "%attr(0755,root,root) /usr/local/bin/nfs-top" \
+                "%doc /usr/local/share/doc/nfs-top/README.md" \
+                "%license /usr/local/share/doc/nfs-top/LICENSE" \
+                > "$RPMTMP/nfs-top.spec"
               rpmbuild --quiet \
                 --define "_topdir $RPMTMP/rpmbuild" \
                 --define "dist %{nil}" \
@@ -83,22 +83,22 @@ EOF
               mkdir -p "$DEB_STAGE/DEBIAN"
               cp -a "$STAGE/." "$DEB_STAGE/"
               INSTALLED_SIZE=$(du -sk --apparent-size "$DEB_STAGE/usr" | cut -f1)
-              cat > "$DEB_STAGE/DEBIAN/control" <<EOF
-Package: nfs-top
-Version: ${VERSION}
-Section: admin
-Priority: optional
-Architecture: amd64
-Maintainer: Blake Golliher <blakegolliher@gmail.com>
-Installed-Size: ${INSTALLED_SIZE}
-Depends: libc6, libelf1, zlib1g, libzstd1
-Homepage: https://github.com/blakegolliher/nfs-top
-Description: Real-time NFS client monitor (bandwidth, IOPS, latency)
- nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads
- /proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and
- optionally enriches per-op latency from kernel-side eBPF probes,
- rendering a live dashboard of per-mount throughput, ops, and latency.
-EOF
+              printf "%s\n" \
+                "Package: nfs-top" \
+                "Version: $VERSION" \
+                "Section: admin" \
+                "Priority: optional" \
+                "Architecture: amd64" \
+                "Maintainer: Blake Golliher <blakegolliher@gmail.com>" \
+                "Installed-Size: $INSTALLED_SIZE" \
+                "Depends: libc6, libelf1, zlib1g, libzstd1" \
+                "Homepage: https://github.com/blakegolliher/nfs-top" \
+                "Description: Real-time NFS client monitor (bandwidth, IOPS, latency)" \
+                " nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads" \
+                " /proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and" \
+                " optionally enriches per-op latency from kernel-side eBPF probes," \
+                " rendering a live dashboard of per-mount throughput, ops, and latency." \
+                > "$DEB_STAGE/DEBIAN/control"
               DEBTMP=$(mktemp -d)
               printf "2.0\n" > "$DEBTMP/debian-binary"
               ( cd "$DEB_STAGE/DEBIAN" \
