@@ -1,0 +1,5 @@
+device nfs-server:/export mounted on /mnt/nfs with fstype nfs4 statvers=1.1
+ opts: rw,vers=4.1,proto=tcp,addr=10.1.1.10,nconnect=4
+ per-op statistics
+ READ: 100 100 0 28000 1048576 50 500 700 0
+ WRITE: 50 50 0 524288 7000 30 400 600 0

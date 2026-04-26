@@ -1,0 +1,404 @@
+## Codex Build Prompt: `nfs-top` — Ratatui demo-style NFS client TUI (with observed connections by IP)
+
+You are an expert Rust engineer specializing in terminal UIs and Linux kernel statistics.
+
+### Goal
+
+Build a production-quality Rust terminal UI (TUI) named **`nfs-top`** that displays **real-time Linux NFS client statistics**. The UI and app architecture must be clearly inspired by Ratatui’s official `examples/apps/demo` app (tabs, table selection, charts/gauges, help footer, event loop, input modes). Users should feel it’s “the Ratatui demo, but for NFS.” ([ratatui.rs](https://ratatui.rs/examples/apps/demo/?utm_source=chatgpt.com))
+
+### Scope (MVP)
+
+* **Client-side only. No server-side (`/proc/net/rpc/nfsd`) stats.**
+* Support NFSv3, NFSv4.1, NFSv4.2 mounts (detect per mount; show and filter/sort across all).
+* Work on kernels **4.18+** (Rocky 8 era) through 6.x.
+* Must include **observed TCP connections** for NFS mounts: **which remote IPs are we connected to**, and counts per IP, so we can validate `nconnect` / distribution.
+
+---
+
+## Data Sources (Linux procfs/sysfs only)
+
+### 1) Per-mount NFS client counters + per-op stats
+
+**Primary source:** `/proc/self/mountstats`
+Parse NFS mount blocks and extract:
+
+* mount identity: mountpoint, device (server:/export), fstype
+* mount options: vers, proto, nconnect, addr=, clientaddr= if present
+* per-op counters and timing aggregates used by `nfsiostat`-style reporting
+  Be robust to format variations across kernel 4.18–6.x and NFS versions. Never panic. Produce partial results if needed. ([man7.org](https://man7.org/linux/man-pages/man8/mountstats.8.html?utm_source=chatgpt.com))
+
+### 2) RPC global client stats (optional/secondary display)
+
+**Source:** `/proc/net/rpc/nfs`
+Parse client RPC counters and expose as a small panel in Overview / Raw. ([man7.org](https://man7.org/linux/man-pages/man8/nfsstat.8.html?utm_source=chatgpt.com))
+
+### 3) Mount option parsing for nconnect and mapping mounts
+
+**Source:** `/proc/mounts` (fallback `/etc/mtab`)
+Extract options including `nconnect=<N>`, `vers=`, `proto=`, `addr=` and map them to mountstats mounts.
+
+### 4) Observed connections by remote IP (required)
+
+We need: for each NFS mount, show the set of remote IPs we are actively connected to, and how many established connections exist to each IP.
+
+Implementation requirement:
+
+* Prefer **socket inode mapping** to associate established TCP sockets with the owning process/namespace and remote endpoint:
+
+  * Parse `/proc/net/tcp` and `/proc/net/tcp6` to find sockets with state `ESTABLISHED` and remote port `2049` (NFS) (and optionally `111` if you later decide; but for MVP stick to `2049`).
+  * Each entry contains a socket inode.
+  * Walk `/proc/<pid>/fd/*` symlinks (`socket:[inode]`) to find which process holds each inode.
+  * For each PID found, map it to a mount’s NFS “userspace client” activity **heuristically**:
+
+    * Primary: match remote IP to mount’s `addr=` (if present) or to resolved IP(s) of the mount’s server name (see below).
+    * Secondary: count all NFS established sockets regardless of process, then bucket them by remote IP; later attribute to mounts by remote IP matching.
+* Also implement **server hostname resolution** for mount device like `server:/export`:
+
+  * Try to resolve `server` via `getaddrinfo` at startup and periodically (cache results, refresh every 60s).
+  * Use resolved IP set to map observed remote IPs to mounts.
+* Do not require root. If `/proc/<pid>/fd` permission blocks inode mapping for other users’ PIDs, gracefully degrade:
+
+  * Still show observed remote IPs from `/proc/net/tcp*` globally for port 2049, but mark attribution confidence lower (show `?`).
+* UI must show “Observed connections per remote IP” for selected mount and total.
+
+Notes:
+
+* This observed approach is kernel-agnostic and works on 4.18+.
+* Must support IPv4 and IPv6.
+* Must handle multiple mounts to same server IP; attribution can be “shared” but still useful for distribution.
+
+---
+
+## UX / UI Requirements (Demo-inspired)
+
+### Tabs (top bar)
+
+Tabs: **Overview**, **RPC Mix**, **Latency**, **Transport**, **Raw**, **Help**
+
+Keyboard:
+
+* `q`: quit
+* `Left/Right` or `h/l`: change tab
+* `Up/Down` or `j/k`: change selected mount in mount table
+* `Enter`: drill into selected mount details (optional; can just update right panel)
+* `Space`: pause/resume sampling
+* `r`: reset baseline (clear history and restart delta window)
+* `f`: filter mounts (input mode)
+* `s`: cycle sort (read, write, ops, rtt, exe, mountpoint, nconnect, observed_conn)
+* `?`: toggle help modal
+
+### Units / Humanize requirements (user-specified)
+
+* Default throughput display is **humanized** (auto scale) using binary units (KiB/MiB/GiB/TiB) or decimal—choose one and keep consistent; document it.
+* Add hotkeys:
+
+  * `g` = force GiB/s (or GB/s consistent with your chosen base)
+  * `m` = force MiB/s
+  * `t` = force TiB/s
+  * `a` = auto (humanize)
+* Same scaling choice must apply to read/write throughput and bytes/op displays.
+* Status bar must show current units mode: `AUTO | MiB | GiB | TiB`
+
+### Overview Tab
+
+Layout:
+
+* Top row: gauges/sparkline panels:
+
+  * Total Read throughput
+  * Total Write throughput
+  * Total Ops/s
+  * “Avg RTT” (overall) or selected mount RTT
+  * “Observed conns” total
+* Center: **Mount table** (selectable)
+* Right panel: selected mount details:
+
+  * device `server:/export`
+  * mountpoint
+  * NFS version
+  * proto (tcp)
+  * nconnect configured
+  * addr= / clientaddr= if present
+  * resolved IPs for server name
+  * observed remote IPs + counts (top N)
+  * last sample time, dt, paused state
+
+Mount table columns:
+
+* Mountpoint
+* Server:Export
+* Vers
+* nconnect
+* Read (units mode)
+* Write (units mode)
+* Ops/s
+* Avg RTT (ms)
+* Avg EXE (ms)
+* Obs Conns (count)  ← total established conns to matching remote IPs
+
+### RPC Mix Tab
+
+For selected mount:
+
+* Table of top N NFS ops by ops/s for last interval and rolling window.
+  Columns:
+* Op
+* Ops/s
+* KB/op (units mode; or fixed KiB)
+* Avg RTT
+* Avg EXE
+
+Ops should include v3 and v4 names; the parser must normalize to a common enum/string set.
+
+### Latency Tab
+
+For selected mount:
+
+* Rolling time-series charts:
+
+  * READ RTT, WRITE RTT
+  * READ EXE, WRITE EXE
+* Show current interval + rolling avg.
+
+### Transport Tab (nconnect + observed distribution)
+
+For selected mount:
+
+* Configured `nconnect=<N>` (or `-`)
+* Observed established connections by **remote IP**:
+
+  * list of `remote_ip -> established_count`
+  * include a “% share” per IP
+* If server resolves to multiple IPs, show which of those are currently used.
+* Provide a “distribution score” (simple):
+
+  * e.g. `max_share` and `entropy` or “evenness” indicator
+  * purely informational
+
+### Raw Tab
+
+Scrollable raw views:
+
+* selected mount’s mountstats block (raw text)
+* `/proc/net/rpc/nfs` raw
+* optional: snippet of current `/proc/net/tcp` matches for port 2049 (for debugging)
+
+### Help Modal/Tab
+
+Keybinds + notes about:
+
+* counters → deltas
+* observed connections attribution caveats
+* unit mode keys
+
+---
+
+## Architecture Requirements (Ratatui demo style)
+
+### Feature flags for backends (like demo)
+
+Support:
+
+* default feature: `crossterm`
+* optional: `termion`
+* optional: `termwiz`
+
+Commands must work:
+
+* `cargo run --release`
+* `cargo run --release --no-default-features --features=termion`
+* `cargo run --release --no-default-features --features=termwiz`
+
+### Suggested crate structure (required)
+
+```
+src/
+  main.rs
+  app.rs
+  tui.rs
+  event.rs
+  ui/
+    mod.rs
+    overview.rs
+    rpc_mix.rs
+    latency.rs
+    transport.rs
+    raw.rs
+    help.rs
+  sampler/
+    mod.rs
+    mountstats.rs
+    rpc.rs
+    mounts.rs
+    sockets.rs
+    dns.rs
+  model/
+    mod.rs
+    types.rs
+    derive.rs
+  util/
+    format.rs
+    ringbuf.rs
+    parse.rs
+tests/
+  fixtures/
+    mountstats_v3.txt
+    mountstats_v41.txt
+    mountstats_v42.txt
+    rpc_nfs.txt
+    proc_net_tcp.txt
+    proc_net_tcp6.txt
+```
+
+### Dependencies (keep tight)
+
+* `ratatui`
+* backend crates: `crossterm` (default) / `termion` / `termwiz` under features
+* `clap`
+* `anyhow` or `thiserror` for errors
+* Avoid tokio; use threads + channels (std) unless truly needed
+
+---
+
+## Sampling / Data Model / Math
+
+### Sampling
+
+* Default interval: 1000ms
+* CLI `--interval-ms`, hotkeys `+/-` to adjust
+* Rolling history length: default 120 samples, CLI `--history`
+
+### Counter deltas
+
+All proc counters are cumulative; compute per mount:
+
+* bytes/s, ops/s by delta over dt
+  Handle resets:
+* If `curr < prev`, treat as reset and skip that rate this tick for that field.
+
+### Per-mount derived metrics
+
+Minimum:
+
+* read_bytes/s, write_bytes/s
+* total_ops/s
+* per-op ops/s
+* kb/op per READ/WRITE (delta_bytes / delta_ops)
+* avg RTT and avg EXE (ms) for READ/WRITE and overall:
+
+  * derived from per-op timing totals if present
+  * If timing totals absent, show `-`
+
+### Observed connection metrics
+
+From `/proc/net/tcp*`:
+
+* Filter:
+
+  * state `01` (ESTABLISHED)
+  * remote port `2049`
+* Parse remote IP and count occurrences.
+* For each mount, determine “matching remote IP set”:
+
+  * if mount options include `addr=IP`, use that
+  * else resolve server hostname to IP set via DNS cache
+  * match observed remote IPs against that IP set
+* `Obs Conns` per mount = sum of established conns to matching IPs
+* In Transport tab, list `remote_ip -> count` for the matched set
+* If server resolves to multiple IPs but none match observed, show empty and warn “no active conns observed”
+
+### DNS resolution
+
+* Implement `dns.rs`:
+
+  * `resolve(host) -> Vec<IpAddr>`
+  * cache results with TTL 60s
+  * never block UI: resolve in background thread or on sampler thread but with short timeouts; if resolution fails, keep old cache or empty.
+
+---
+
+## CLI Requirements
+
+Using `clap`, implement:
+
+* `--interval-ms <N>` default 1000
+* `--history <N>` default 120
+* `--mount <substring>` initial filter (mountpoint or server match)
+* `--sort <key>` initial sort: `read|write|ops|rtt|exe|mount|nconnect|obsconn`
+* `--units <auto|m|g|t>` initial units mode
+* `--no-dns` disable hostname resolution (only addr= can match)
+* `--raw-dump <path>` dump current parsed snapshot and exit (custom text ok)
+  Exit codes:
+* 0 success
+* 2 if required proc files unreadable
+* 3 invalid args
+
+---
+
+## Parser Requirements
+
+### `/proc/self/mountstats`
+
+Robustly parse mount blocks and extract:
+
+* mountpoint and device and fstype lines
+* options line (capture `vers=`, `proto=`, `nconnect=`, `addr=`, `clientaddr=`)
+* per-op sections:
+
+  * normalize op name tokens
+  * extract op count, bytes if present, timing totals (rtt/exe) if present
+    Ignore unknown/extra fields.
+
+### `/proc/net/tcp` and `/proc/net/tcp6`
+
+Parse per line:
+
+* local addr:port
+* remote addr:port
+* state
+* inode
+  Convert hex ip/port to IpAddr/u16.
+
+Unit tests must cover these parsers using fixtures.
+
+---
+
+## Acceptance Criteria
+
+1. Builds and runs on Linux kernels 4.18+.
+2. If any NFS mounts exist, Overview shows them and updates rates live.
+3. `nconnect` displayed from mount options.
+4. Units mode works: auto/humanize and forced `m/g/t` hotkeys.
+5. Observed remote IP connections:
+
+   * Transport tab for a mount shows remote IPs and established counts when traffic exists.
+   * Overview table shows Obs Conns count.
+6. No panics on weird proc formats; degrade gracefully.
+7. Compiles with crossterm default and with termion/termwiz feature combos.
+8. Tests:
+
+   * mountstats parsing across v3/v4.1/v4.2 fixtures
+   * tcp/tcp6 parsing fixtures
+   * delta/rate logic including counter reset
+
+---
+
+## README Requirements
+
+Include:
+
+* run commands mirroring Ratatui demo style
+* explanation of data sources
+* limitations (observed connection attribution caveats, DNS reliance)
+* keybind list
+
+---
+
+## Final Implementation Guidance
+
+* Use a sampler thread reading proc files and publishing `Snapshot` over channel.
+* UI loop uses a tick (~50–100ms) for responsive input.
+* Keep a ring buffer per charted metric.
+* Provide a status bar: backend | interval | paused | filter | sort | units
+
+include both 2049 and 20049 + CLI override
