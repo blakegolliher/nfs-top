@@ -48,7 +48,39 @@ jobs:
               TAR_BASE="nfs-top-${VERSION}-x86_64-linux"
               ( cd "$STAGE" && tar --owner=0 --group=0 -czf "/work/dist/${TAR_BASE}.tar.gz" . )
 
-              # ---------- rpm ----------
+              # ---------- deb (pure ar+tar; dpkg-deb absent on Rocky) ----------
+              # Build deb before rpm: rpmbuild auto-cleans its --buildroot,
+              # which would delete $STAGE before we could read it.
+              DEB_STAGE=$(mktemp -d)
+              mkdir -p "$DEB_STAGE/DEBIAN"
+              cp -a "$STAGE/." "$DEB_STAGE/"
+              INSTALLED_SIZE=$(du -sk --apparent-size "$DEB_STAGE/usr" | cut -f1)
+              printf "%s\n" \
+                "Package: nfs-top" \
+                "Version: $VERSION" \
+                "Section: admin" \
+                "Priority: optional" \
+                "Architecture: amd64" \
+                "Maintainer: Blake Golliher <blakegolliher@gmail.com>" \
+                "Installed-Size: $INSTALLED_SIZE" \
+                "Depends: libc6, libelf1, zlib1g, libzstd1" \
+                "Homepage: https://github.com/blakegolliher/nfs-top" \
+                "Description: Real-time NFS client monitor (bandwidth, IOPS, latency)" \
+                " nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads" \
+                " /proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and" \
+                " optionally enriches per-op latency from kernel-side eBPF probes," \
+                " rendering a live dashboard of per-mount throughput, ops, and latency." \
+                > "$DEB_STAGE/DEBIAN/control"
+              DEBTMP=$(mktemp -d)
+              printf "2.0\n" > "$DEBTMP/debian-binary"
+              ( cd "$DEB_STAGE/DEBIAN" \
+                && tar --owner=0 --group=0 --format=gnu -czf "$DEBTMP/control.tar.gz" . )
+              ( cd "$DEB_STAGE" \
+                && tar --owner=0 --group=0 --format=gnu --exclude=./DEBIAN -czf "$DEBTMP/data.tar.gz" . )
+              ( cd "$DEBTMP" \
+                && ar rc "/work/dist/nfs-top_${VERSION}-1_amd64.deb" debian-binary control.tar.gz data.tar.gz )
+
+              # ---------- rpm ---------- (last: rpmbuild deletes $STAGE)
               RPMTMP=$(mktemp -d)
               mkdir -p "$RPMTMP/rpmbuild"/{BUILD,RPMS,SRPMS,SOURCES,SPECS}
               printf "%s\n" \
@@ -78,36 +110,6 @@ jobs:
                 --target x86_64 \
                 -bb "$RPMTMP/nfs-top.spec"
               cp "$RPMTMP/rpmbuild/RPMS/x86_64/nfs-top-${VERSION}-1.x86_64.rpm" /work/dist/
-
-              # ---------- deb (pure ar+tar; dpkg-deb absent on Rocky) ----------
-              DEB_STAGE=$(mktemp -d)
-              mkdir -p "$DEB_STAGE/DEBIAN"
-              cp -a "$STAGE/." "$DEB_STAGE/"
-              INSTALLED_SIZE=$(du -sk --apparent-size "$DEB_STAGE/usr" | cut -f1)
-              printf "%s\n" \
-                "Package: nfs-top" \
-                "Version: $VERSION" \
-                "Section: admin" \
-                "Priority: optional" \
-                "Architecture: amd64" \
-                "Maintainer: Blake Golliher <blakegolliher@gmail.com>" \
-                "Installed-Size: $INSTALLED_SIZE" \
-                "Depends: libc6, libelf1, zlib1g, libzstd1" \
-                "Homepage: https://github.com/blakegolliher/nfs-top" \
-                "Description: Real-time NFS client monitor (bandwidth, IOPS, latency)" \
-                " nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads" \
-                " /proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and" \
-                " optionally enriches per-op latency from kernel-side eBPF probes," \
-                " rendering a live dashboard of per-mount throughput, ops, and latency." \
-                > "$DEB_STAGE/DEBIAN/control"
-              DEBTMP=$(mktemp -d)
-              printf "2.0\n" > "$DEBTMP/debian-binary"
-              ( cd "$DEB_STAGE/DEBIAN" \
-                && tar --owner=0 --group=0 --format=gnu -czf "$DEBTMP/control.tar.gz" . )
-              ( cd "$DEB_STAGE" \
-                && tar --owner=0 --group=0 --format=gnu --exclude=./DEBIAN -czf "$DEBTMP/data.tar.gz" . )
-              ( cd "$DEBTMP" \
-                && ar rc "/work/dist/nfs-top_${VERSION}-1_amd64.deb" debian-binary control.tar.gz data.tar.gz )
 
               ls -lh /work/dist
             '
