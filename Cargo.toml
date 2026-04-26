@@ -30,3 +30,7 @@ libbpf-rs = { version = "0.24", optional = true }
 
 [build-dependencies]
 libbpf-cargo = { version = "0.24", optional = true }
+
+[[example]]
+name = "bpf_smoke"
+required-features = ["ebpf"]

@@ -46,9 +46,15 @@ pub fn op_name(id: u16) -> &'static str {
 ///
 /// The `OpenObject` storage is held in a Box so the loaded `NfsLatSkel`'s
 /// internal references remain valid for the lifetime of `Enricher`.
+///
+/// **Field order is load-bearing.** Rust drops fields in declaration
+/// order, and `skel` holds raw pointers into the `OpenObject` storage
+/// (we faked the `'static` bound via transmute). `skel` must therefore
+/// be declared before `_open_object` so it's dropped first; reversing
+/// these two fields will segfault on Drop.
 pub struct Enricher {
-    _open_object: Box<MaybeUninit<OpenObject>>,
     skel: NfsLatSkel<'static>,
+    _open_object: Box<MaybeUninit<OpenObject>>,
     /// Last-seen absolute count for every (op_id, bucket) we've ever
     /// observed in the kernel `hist` map. Used to compute per-tick deltas
     /// without resetting the map (snapshot-and-diff).
@@ -73,8 +79,8 @@ impl Enricher {
         let mut loaded = open.load().context("loading BPF skeleton")?;
         loaded.attach().context("attaching BPF tracepoints")?;
         Ok(Self {
-            _open_object: open_object,
             skel: loaded,
+            _open_object: open_object,
             prev: HashMap::new(),
         })
     }
