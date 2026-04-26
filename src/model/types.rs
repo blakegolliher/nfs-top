@@ -91,7 +91,6 @@ pub struct ServerAgg {
 
 #[derive(Debug, Clone, Default)]
 pub struct RpcClientCounters {
-    pub fields: HashMap<String, u64>,
     pub raw: String,
 }
 
@@ -101,7 +100,6 @@ pub struct Snapshot {
     pub dt_secs: f64,
     pub mounts: Vec<MountView>,
     pub rpc: RpcClientCounters,
-    pub total_observed_conns: u64,
     pub raw_tcp_matches: Vec<String>,
 }
 

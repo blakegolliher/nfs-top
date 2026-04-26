@@ -137,7 +137,6 @@ pub struct App {
     pub selected: usize,
     pub server_selected: usize,
     pub paused: bool,
-    pub help_open: bool,
     pub filter: String,
     pub sort: SortKey,
     pub units: UnitsMode,
@@ -147,7 +146,6 @@ pub struct App {
     pub write_hist: RingBuf<f64>,
     pub ops_hist: RingBuf<f64>,
     pub rtt_hist: RingBuf<f64>,
-    pub obs_hist: RingBuf<f64>,
     pub cumulative_read_bytes: f64,
     pub cumulative_write_bytes: f64,
     pub last_error: Option<String>,
@@ -165,7 +163,6 @@ impl App {
             selected: 0,
             server_selected: 0,
             paused: false,
-            help_open: false,
             filter,
             sort,
             units,
@@ -176,7 +173,6 @@ impl App {
             write_hist: RingBuf::new(history),
             ops_hist: RingBuf::new(history),
             rtt_hist: RingBuf::new(history),
-            obs_hist: RingBuf::new(history),
             cumulative_read_bytes: 0.0,
             cumulative_write_bytes: 0.0,
             last_sample: None,
@@ -192,7 +188,6 @@ impl App {
         self.write_hist.clear();
         self.ops_hist.clear();
         self.rtt_hist.clear();
-        self.obs_hist.clear();
         self.cumulative_read_bytes = 0.0;
         self.cumulative_write_bytes = 0.0;
         self.mount_histories.clear();
@@ -207,7 +202,6 @@ impl App {
         let total_read: f64 = filtered.iter().map(|m| m.derived.read_bps).sum();
         let total_write: f64 = filtered.iter().map(|m| m.derived.write_bps).sum();
         let total_ops: f64 = filtered.iter().map(|m| m.derived.ops_per_sec).sum();
-        let total_obs: f64 = filtered.iter().map(|m| m.derived.observed_conns as f64).sum();
         let total_rtt = filtered.iter().filter_map(|m| m.derived.avg_rtt_ms).sum::<f64>();
         let rtt_count = filtered.iter().filter(|m| m.derived.avg_rtt_ms.is_some()).count();
         self.read_hist.push(total_read);
@@ -218,7 +212,6 @@ impl App {
             self.cumulative_write_bytes += total_write * snap.dt_secs;
         }
         self.rtt_hist.push(if rtt_count > 0 { total_rtt / (rtt_count as f64) } else { 0.0 });
-        self.obs_hist.push(total_obs);
         for m in &snap.mounts {
             let h = self
                 .mount_histories

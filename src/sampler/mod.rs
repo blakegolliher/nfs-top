@@ -99,7 +99,6 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
             let snap = Snapshot {
                 ts: now,
                 dt_secs,
-                total_observed_conns: sockets.by_remote_ip.values().sum(),
                 mounts: views,
                 rpc,
                 raw_tcp_matches: sockets.raw_matches,
