@@ -1,0 +1,147 @@
+name: release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build binary and packages on Rocky 9
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          docker run --rm \
+            -v "$PWD:/work" \
+            -w /work \
+            -e VERSION="${REF_NAME#v}" \
+            rockylinux:9 \
+            bash -euxc '
+              dnf -y install \
+                gcc clang llvm-devel \
+                elfutils-libelf-devel zlib-devel libzstd-devel \
+                pkgconfig rpm-build binutils tar gzip curl make
+              curl -sSf https://sh.rustup.rs | sh -s -- -y \
+                --default-toolchain stable --profile minimal
+              source "$HOME/.cargo/env"
+
+              cargo build --release --features ebpf
+              strip --strip-unneeded target/release/nfs-top
+
+              STAGE=$(mktemp -d)
+              mkdir -p "$STAGE/usr/local/bin"
+              mkdir -p "$STAGE/usr/local/share/doc/nfs-top"
+              install -m 0755 target/release/nfs-top "$STAGE/usr/local/bin/nfs-top"
+              install -m 0644 README.md "$STAGE/usr/local/share/doc/nfs-top/README.md"
+              install -m 0644 LICENSE   "$STAGE/usr/local/share/doc/nfs-top/LICENSE"
+
+              # ---------- tarball ----------
+              TAR_BASE="nfs-top-${VERSION}-x86_64-linux"
+              ( cd "$STAGE" && tar --owner=0 --group=0 -czf "/work/dist/${TAR_BASE}.tar.gz" . )
+
+              # ---------- rpm ----------
+              RPMTMP=$(mktemp -d)
+              mkdir -p "$RPMTMP/rpmbuild"/{BUILD,RPMS,SRPMS,SOURCES,SPECS}
+              cat > "$RPMTMP/nfs-top.spec" <<EOF
+Name:        nfs-top
+Version:     ${VERSION}
+Release:     1
+Summary:     Real-time NFS client monitor (bandwidth, IOPS, latency)
+License:     MIT
+URL:         https://github.com/blakegolliher/nfs-top
+BuildArch:   x86_64
+
+%description
+nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads
+/proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and
+optionally enriches per-op latency from kernel-side eBPF probes,
+rendering a live dashboard of per-mount throughput, ops, and latency.
+
+%files
+%attr(0755,root,root) /usr/local/bin/nfs-top
+%doc /usr/local/share/doc/nfs-top/README.md
+%license /usr/local/share/doc/nfs-top/LICENSE
+EOF
+              rpmbuild --quiet \
+                --define "_topdir $RPMTMP/rpmbuild" \
+                --define "dist %{nil}" \
+                --buildroot "$STAGE" \
+                --target x86_64 \
+                -bb "$RPMTMP/nfs-top.spec"
+              cp "$RPMTMP/rpmbuild/RPMS/x86_64/nfs-top-${VERSION}-1.x86_64.rpm" /work/dist/
+
+              # ---------- deb (pure ar+tar; dpkg-deb absent on Rocky) ----------
+              DEB_STAGE=$(mktemp -d)
+              mkdir -p "$DEB_STAGE/DEBIAN"
+              cp -a "$STAGE/." "$DEB_STAGE/"
+              INSTALLED_SIZE=$(du -sk --apparent-size "$DEB_STAGE/usr" | cut -f1)
+              cat > "$DEB_STAGE/DEBIAN/control" <<EOF
+Package: nfs-top
+Version: ${VERSION}
+Section: admin
+Priority: optional
+Architecture: amd64
+Maintainer: Blake Golliher <blakegolliher@gmail.com>
+Installed-Size: ${INSTALLED_SIZE}
+Depends: libc6, libelf1, zlib1g, libzstd1
+Homepage: https://github.com/blakegolliher/nfs-top
+Description: Real-time NFS client monitor (bandwidth, IOPS, latency)
+ nfs-top is a Ratatui-inspired Linux NFS client monitor. It reads
+ /proc/self/mountstats, /proc/net/rpc/nfs, and /proc/net/tcp{,6}, and
+ optionally enriches per-op latency from kernel-side eBPF probes,
+ rendering a live dashboard of per-mount throughput, ops, and latency.
+EOF
+              DEBTMP=$(mktemp -d)
+              printf "2.0\n" > "$DEBTMP/debian-binary"
+              ( cd "$DEB_STAGE/DEBIAN" \
+                && tar --owner=0 --group=0 --format=gnu -czf "$DEBTMP/control.tar.gz" . )
+              ( cd "$DEB_STAGE" \
+                && tar --owner=0 --group=0 --format=gnu --exclude=./DEBIAN -czf "$DEBTMP/data.tar.gz" . )
+              ( cd "$DEBTMP" \
+                && ar rc "/work/dist/nfs-top_${VERSION}-1_amd64.deb" debian-binary control.tar.gz data.tar.gz )
+
+              ls -lh /work/dist
+            '
+
+      - name: Create GitHub Release
+        env:
+          REF_NAME: ${{ github.ref_name }}
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/nfs-top-*.tar.gz
+            dist/nfs-top-*.rpm
+            dist/nfs-top_*.deb
+          generate_release_notes: true
+          body: |
+            ## Install
+
+            **RHEL / Rocky / Alma 9, Fedora:**
+            ```
+            sudo dnf install ./nfs-top-VERSION-1.x86_64.rpm
+            ```
+
+            **Ubuntu 22.04+ / Debian 12+:**
+            ```
+            sudo apt install ./nfs-top_VERSION-1_amd64.deb
+            ```
+
+            **Tarball (extract to /):**
+            ```
+            sudo tar -C / -xzf nfs-top-VERSION-x86_64-linux.tar.gz
+            ```
+
+            Replace `VERSION` with the release version above (without the leading `v`).
+
+            ## Requirements
+
+            - Linux kernel 5.14+ with BTF (RHEL/Rocky 9, Ubuntu 22.04+, Debian 12+)
+            - Run as root or with `CAP_BPF` for the eBPF latency enricher
