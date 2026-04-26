@@ -74,11 +74,6 @@ pub fn panel(title: &str) -> Block<'_> {
         .style(Style::default().bg(PANEL))
 }
 
-pub fn split_h(area: Rect, n: usize) -> Vec<Rect> {
-    let c = vec![Constraint::Ratio(1, n as u32); n];
-    Layout::default().direction(Direction::Horizontal).constraints(c).split(area).to_vec()
-}
-
 /// Render a line chart card with a title, current value header, and braille line graph.
 pub fn draw_line_card(f: &mut Frame<'_>, area: Rect, title: &str, series: &[f64], value: &str, color: Color) {
     let block = panel(title);
