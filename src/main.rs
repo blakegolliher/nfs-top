@@ -12,7 +12,7 @@ use nfs_top::sampler::{spawn_sampler, SamplerConfig};
 use nfs_top::tui;
 
 #[derive(Parser, Debug)]
-#[command(name = "nfs-top")]
+#[command(name = "nfs-top", version)]
 struct Cli {
     #[arg(long, default_value_t = 1000)]
     interval_ms: u64,
