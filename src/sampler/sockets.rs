@@ -13,14 +13,13 @@ pub struct SocketObs {
 
 pub fn read_observed_nfs(remote_ports: &[u16]) -> Result<SocketObs> {
     let mut out = SocketObs::default();
-    parse_tcp_file("/proc/net/tcp", false, remote_ports, &mut out)?;
-    parse_tcp_file("/proc/net/tcp6", true, remote_ports, &mut out)?;
+    parse_tcp_lines(&fs::read_to_string("/proc/net/tcp")?, false, remote_ports, &mut out);
+    parse_tcp_lines(&fs::read_to_string("/proc/net/tcp6")?, true, remote_ports, &mut out);
     Ok(out)
 }
 
-fn parse_tcp_file(path: &str, v6: bool, ports: &[u16], out: &mut SocketObs) -> Result<()> {
-    let raw = fs::read_to_string(path)?;
-    for line in raw.lines().skip(1) {
+pub fn parse_tcp_lines(input: &str, v6: bool, ports: &[u16], out: &mut SocketObs) {
+    for line in input.lines().skip(1) {
         let cols: Vec<&str> = line.split_whitespace().collect();
         if cols.len() < 10 {
             continue;
@@ -42,7 +41,6 @@ fn parse_tcp_file(path: &str, v6: bool, ports: &[u16], out: &mut SocketObs) -> R
         *out.by_remote_ip.entry(ip).or_insert(0) += 1;
         out.raw_matches.push(line.to_string());
     }
-    Ok(())
 }
 
 #[cfg(test)]
