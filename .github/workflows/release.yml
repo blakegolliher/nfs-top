@@ -28,7 +28,7 @@ jobs:
               dnf -y install \
                 gcc clang llvm-devel \
                 elfutils-libelf-devel zlib-devel libzstd-devel \
-                pkgconfig rpm-build binutils tar gzip curl make
+                pkgconfig rpm-build binutils tar gzip make
               curl -sSf https://sh.rustup.rs | sh -s -- -y \
                 --default-toolchain stable --profile minimal
               source "$HOME/.cargo/env"
