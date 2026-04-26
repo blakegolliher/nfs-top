@@ -21,25 +21,24 @@ pub fn read_observed_nfs(remote_ports: &[u16]) -> Result<SocketObs> {
 }
 
 pub fn parse_tcp_lines(input: &str, v6: bool, ports: &[u16], out: &mut SocketObs) {
+    // /proc/net/tcp{,6} can have tens of thousands of lines on busy hosts.
+    // Filter cheap fields (state, port) before parsing the IP, and avoid
+    // collecting the whole line into a Vec when only 4 fields are needed.
     for line in input.lines().skip(1) {
-        let cols: Vec<&str> = line.split_whitespace().collect();
-        if cols.len() < 10 {
-            continue;
-        }
-        let (raddr, rport) = match cols[2].split_once(':') {
-            Some(x) => x,
-            None => continue,
+        let mut it = line.split_whitespace();
+        let (_sl, _local, remote, state) = match (it.next(), it.next(), it.next(), it.next()) {
+            (Some(a), Some(b), Some(c), Some(d)) => (a, b, c, d),
+            _ => continue,
         };
-        let state = cols[3];
         if state != "01" {
             continue;
         }
-        let Some((ip, port)) = parse_tcp_hex_endpoint(raddr, rport, v6) else {
-            continue;
-        };
+        let Some((raddr, rport)) = remote.split_once(':') else { continue };
+        let Ok(port) = u16::from_str_radix(rport, 16) else { continue };
         if !ports.contains(&port) {
             continue;
         }
+        let Some((ip, _)) = parse_tcp_hex_endpoint(raddr, rport, v6) else { continue };
         *out.by_remote_ip.entry(ip).or_insert(0) += 1;
         out.raw_matches.push(line.to_string());
     }
