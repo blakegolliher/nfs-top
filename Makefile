@@ -51,6 +51,8 @@ help:
 	@echo "make portable TARGET=<triple> Build one static target (uses cargo-zigbuild if present)"
 	@echo "make deb                    Build a .deb for the host arch (set DEB_TARGET=<triple> to cross)"
 	@echo "make deb-all                Build .debs for all $(TARGETS)"
+	@echo "make rpm                    Build an .rpm for the host arch (set RPM_TARGET=<triple> to cross)"
+	@echo "make rpm-all                Build .rpms for all $(TARGETS)"
 	@echo "make clean-dist             Remove dist/ artifacts"
 	@echo
 	@echo "Variables:"
@@ -59,6 +61,7 @@ help:
 	@echo "  OUTDIR=$(OUTDIR)"
 	@echo "  PKG_NAME=$(PKG_NAME)  PKG_VERSION=$(PKG_VERSION)"
 	@echo "  PKG_MAINTAINER=$(PKG_MAINTAINER)"
+	@echo "  PKG_LICENSE=$(PKG_LICENSE)  RPM_RELEASE=$(RPM_RELEASE)"
 
 .PHONY: portable-host
 portable-host:
@@ -173,3 +176,84 @@ deb-all:
 .PHONY: deb-clean
 deb-clean:
 	@rm -rf $(OUTDIR)/deb $(OUTDIR)/*.deb
+
+# ---- RPM packaging -----------------------------------------------------------
+# Produces a .rpm for installation on RHEL/Rocky/Fedora/SUSE. Uses `rpmbuild`
+# directly with a generated spec file so no extra cargo tooling is required.
+# Mirrors the .deb pipeline: build a portable musl binary, stage into a
+# BUILDROOT, then package.
+
+PKG_LICENSE ?= MIT
+RPM_RELEASE ?= 1
+RPM_TARGET  ?= $(HOST_MUSL_TARGET)
+
+# Map Rust target triple -> RPM architecture.
+ifneq (,$(findstring x86_64,$(RPM_TARGET)))
+RPM_ARCH := x86_64
+else ifneq (,$(findstring aarch64,$(RPM_TARGET)))
+RPM_ARCH := aarch64
+else ifneq (,$(findstring armv7,$(RPM_TARGET)))
+RPM_ARCH := armv7hl
+else
+RPM_ARCH := unknown
+endif
+
+RPM_FILE := $(OUTDIR)/$(PKG_NAME)-$(PKG_VERSION)-$(RPM_RELEASE).$(RPM_ARCH).rpm
+
+.PHONY: rpm
+rpm:
+	@command -v rpmbuild >/dev/null || { echo "rpmbuild not found (install rpm-build)"; exit 2; }
+	@if [[ "$(RPM_ARCH)" == "unknown" ]]; then \
+		echo "RPM_TARGET=$(RPM_TARGET) does not map to an RPM arch (x86_64|aarch64|armv7hl)"; exit 2; \
+	fi
+	@$(MAKE) portable TARGET=$(RPM_TARGET) PROFILE=$(PROFILE) FEATURES="$(FEATURES)" OUTDIR="$(OUTDIR)"
+	@mkdir -p $(OUTDIR)
+	@tmp=$$(mktemp -d); trap "rm -rf $$tmp" EXIT; \
+	  buildroot=$$tmp/buildroot; \
+	  mkdir -p $$buildroot/usr/bin $$buildroot/usr/share/doc/$(PKG_NAME); \
+	  install -m 0755 $(OUTDIR)/$(BIN)-$(RPM_TARGET) $$buildroot/usr/bin/$(BIN); \
+	  if [[ -f README.md ]]; then install -m 0644 README.md $$buildroot/usr/share/doc/$(PKG_NAME)/README; fi; \
+	  spec=$$tmp/$(PKG_NAME).spec; \
+	  { \
+	    echo "Name:       $(PKG_NAME)"; \
+	    echo "Version:    $(PKG_VERSION)"; \
+	    echo "Release:    $(RPM_RELEASE)"; \
+	    echo "Summary:    $(PKG_DESCRIPTION)"; \
+	    echo "License:    $(PKG_LICENSE)"; \
+	    echo "URL:        $(PKG_HOMEPAGE)"; \
+	    echo "Packager:   $(PKG_MAINTAINER)"; \
+	    echo "BuildArch:  $(RPM_ARCH)"; \
+	    echo "AutoReqProv: no"; \
+	    echo "%define _build_id_links none"; \
+	    echo "%define __strip /bin/true"; \
+	    echo ""; \
+	    echo "%description"; \
+	    echo "Linux NFS client monitor that reads /proc/self/mountstats,"; \
+	    echo "/proc/net/rpc/nfs, and /proc/net/tcp{,6} and renders a live"; \
+	    echo "ratatui dashboard of per-mount throughput, ops, and latency."; \
+	    echo ""; \
+	    echo "%files"; \
+	    echo "%attr(0755,root,root) /usr/bin/$(BIN)"; \
+	    if [[ -f README.md ]]; then echo "%doc /usr/share/doc/$(PKG_NAME)/README"; fi; \
+	  } > $$spec; \
+	  mkdir -p $$tmp/rpmbuild/{BUILD,RPMS,SRPMS,SOURCES,SPECS}; \
+	  rpmbuild --quiet \
+	    --define "_topdir $$tmp/rpmbuild" \
+	    --define "dist %{nil}" \
+	    --buildroot $$buildroot \
+	    --target $(RPM_ARCH) \
+	    -bb $$spec; \
+	  cp $$tmp/rpmbuild/RPMS/$(RPM_ARCH)/$(PKG_NAME)-$(PKG_VERSION)-$(RPM_RELEASE).$(RPM_ARCH).rpm $(RPM_FILE)
+	@echo "Built $(RPM_FILE)"
+	@ls -lh $(RPM_FILE)
+
+.PHONY: rpm-all
+rpm-all:
+	@for t in $(TARGETS); do \
+		$(MAKE) rpm RPM_TARGET=$$t PROFILE=$(PROFILE) FEATURES="$(FEATURES)" OUTDIR="$(OUTDIR)" || exit $$?; \
+	done
+	@echo "All .rpm artifacts are in $(OUTDIR)/"
+
+.PHONY: rpm-clean
+rpm-clean:
+	@rm -f $(OUTDIR)/*.rpm

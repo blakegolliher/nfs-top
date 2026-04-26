@@ -22,6 +22,18 @@ Ratatui-inspired Linux NFS client monitor for `/proc/*` data sources.
 
 Artifacts are placed in `dist/` as `nfs-top-<target>`.
 
+## Packages
+
+- `make rpm` — Build an `.rpm` for the host arch (set `RPM_TARGET=<triple>`
+  to cross-package). Output: `dist/nfs-top-<version>-<release>.<arch>.rpm`.
+  Requires `rpmbuild` (`dnf install rpm-build`).
+- `make rpm-all` — Build `.rpm`s for all targets.
+- `make deb` / `make deb-all` — Equivalent for `.deb`. Works on RHEL hosts
+  via an `ar`+`tar` fallback when `dpkg-deb` isn't installed.
+
+Override per-package metadata with `PKG_LICENSE=...`, `PKG_MAINTAINER=...`,
+`RPM_RELEASE=...`, etc. See `make help`.
+
 ## CLI
 
 - `--interval-ms <N>` sampling interval, default `1000`
@@ -59,3 +71,17 @@ Artifacts are placed in `dist/` as `nfs-top-<target>`.
 - Connection attribution to mounts is heuristic and primarily based on `addr=` and DNS resolution of `server:/export` hostnames.
 - Per-op timing fields vary across kernel/NFS versions, so some latency cells can show `-` when unavailable.
 - PID/inode ownership correlation is not enforced in this MVP; observed connections are remote-IP based.
+
+## Future work
+
+- **eBPF-based sampling.** Replace (or augment) the `/proc`-based samplers
+  with eBPF probes on the kernel's NFS/SUNRPC tracepoints (e.g.
+  `nfs:nfs_initiate_read`, `sunrpc:rpc_task_begin`, `sunrpc:xprt_transmit`).
+  This would give per-call latency histograms, per-PID attribution, and
+  fewer surprises from kernel-version drift in the `/proc/self/mountstats`
+  format. Cost: requires `CAP_BPF` (or root) and a kernel new enough for
+  CO-RE; the `/proc` path stays as a fallback for restricted environments.
+- **Richer packaging.** The `.deb` target is functional but minimal
+  (control file + binary). A future pass could add proper
+  `/usr/share/doc/<pkg>/copyright`, a `man` page, shell completions, and
+  signed releases for both `.deb` and `.rpm`.
