@@ -1,12 +1,16 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 
 use crate::model::types::{MountCounters, OpCounters};
 use crate::util::parse::{parse_ip_maybe, parse_kv_options};
 
+const MOUNTSTATS_PATH: &str = "/proc/self/mountstats";
+
 pub fn read_mountstats() -> Result<Vec<MountCounters>> {
-    parse_mountstats(&fs::read_to_string("/proc/self/mountstats")?)
+    let raw = fs::read_to_string(MOUNTSTATS_PATH)
+        .with_context(|| format!("reading {MOUNTSTATS_PATH}"))?;
+    parse_mountstats(&raw)
 }
 
 pub fn parse_mountstats(input: &str) -> Result<Vec<MountCounters>> {

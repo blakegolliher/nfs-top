@@ -1,9 +1,11 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::collections::HashMap;
 use std::fs;
 
 pub fn read_mount_options() -> Result<HashMap<String, HashMap<String, String>>> {
-    let data = fs::read_to_string("/proc/mounts").or_else(|_| fs::read_to_string("/etc/mtab"))?;
+    let data = fs::read_to_string("/proc/mounts")
+        .or_else(|_| fs::read_to_string("/etc/mtab"))
+        .context("reading /proc/mounts (and /etc/mtab fallback)")?;
     let mut out = HashMap::new();
     for line in data.lines() {
         let cols: Vec<&str> = line.split_whitespace().collect();

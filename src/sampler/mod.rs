@@ -40,9 +40,14 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
                     continue;
                 }
             };
-            let mount_opts = mounts::read_mount_options().unwrap_or_default();
-            let rpc = rpc::read_rpc_client().unwrap_or_default();
-            let sockets = sockets::read_observed_nfs(&cfg.remote_ports).unwrap_or_default();
+            let mut partial_errors: Vec<String> = Vec::new();
+            let mount_opts = fallback("mounts", &mut partial_errors, mounts::read_mount_options());
+            let rpc = fallback("rpc", &mut partial_errors, rpc::read_rpc_client());
+            let sockets = fallback(
+                "sockets",
+                &mut partial_errors,
+                sockets::read_observed_nfs(&cfg.remote_ports),
+            );
 
             let dt_secs = prev
                 .as_ref()
@@ -102,6 +107,7 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
                 mounts: views,
                 rpc,
                 raw_tcp_matches: sockets.raw_matches,
+                partial_errors,
             };
 
             let _ = tx.send(Ok(snap));
@@ -188,6 +194,13 @@ fn derive_rates(
         observed_by_ip,
         per_op,
     }
+}
+
+fn fallback<T: Default>(label: &str, errors: &mut Vec<String>, r: Result<T>) -> T {
+    r.unwrap_or_else(|e| {
+        errors.push(format!("{label}: {e:#}"));
+        T::default()
+    })
 }
 
 fn delta_u64(prev: Option<u64>, curr: u64) -> u64 {

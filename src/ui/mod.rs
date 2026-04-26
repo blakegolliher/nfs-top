@@ -50,18 +50,22 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
             Style::default().fg(Color::White).bg(Color::Red),
         )
     } else {
-        (
-            format!(
-                "backend:crossterm interval:{}ms paused:{} filter:{} sort:{} units:{} trend:{}",
-                app.interval_ms(),
-                if app.paused { "yes" } else { "no" },
-                if app.filter.is_empty() { "-" } else { &app.filter },
-                app.sort.as_str(),
-                app.units.label(),
-                app.percentile_mode.label(),
-            ),
-            Style::default().fg(Color::Black).bg(WARN),
-        )
+        let mut s = format!(
+            "backend:crossterm interval:{}ms paused:{} filter:{} sort:{} units:{} trend:{}",
+            app.interval_ms(),
+            if app.paused { "yes" } else { "no" },
+            if app.filter.is_empty() { "-" } else { &app.filter },
+            app.sort.as_str(),
+            app.units.label(),
+            app.percentile_mode.label(),
+        );
+        if let Some(snap) = app.snapshot.as_ref()
+            && !snap.partial_errors.is_empty()
+        {
+            s.push_str(" warn:");
+            s.push_str(&snap.partial_errors.join("; "));
+        }
+        (s, Style::default().fg(Color::Black).bg(WARN))
     };
     let p = Paragraph::new(status).style(status_style);
     f.render_widget(p, areas[2]);
