@@ -138,6 +138,7 @@ pub struct App {
     pub server_selected: usize,
     pub paused: bool,
     pub filter: String,
+    filter_lower: String,
     pub sort: SortKey,
     pub units: UnitsMode,
     pub interval: Arc<AtomicU64>,
@@ -154,16 +155,24 @@ pub struct App {
     history_len: usize,
     mount_histories: HashMap<String, MountHistory>,
     server_histories: HashMap<Option<IpAddr>, ServerHistory>,
+    /// Indices into snapshot.mounts in display (sorted+filtered) order.
+    /// Recomputed only on ingest or sort change.
+    cached_visible_idx: Vec<usize>,
+    /// Per-server aggregates in display (sorted) order. Recomputed only on
+    /// ingest or sort change. UI reads via `aggregate_servers()`.
+    cached_servers: Vec<ServerAgg>,
 }
 
 impl App {
     pub fn new(history: usize, units: UnitsMode, interval: Arc<AtomicU64>, sort: SortKey, filter: String) -> Self {
+        let filter_lower = filter.to_lowercase();
         Self {
             tab: Tab::Overview,
             selected: 0,
             server_selected: 0,
             paused: false,
             filter,
+            filter_lower,
             sort,
             units,
             interval,
@@ -180,6 +189,8 @@ impl App {
             history_len: history,
             mount_histories: HashMap::new(),
             server_histories: HashMap::new(),
+            cached_visible_idx: Vec::new(),
+            cached_servers: Vec::new(),
         }
     }
 
@@ -198,47 +209,56 @@ impl App {
         if self.paused {
             return;
         }
-        let filtered = snap.mounts.iter().filter(|m| self.matches_filter(m)).collect::<Vec<_>>();
-        let total_read: f64 = filtered.iter().map(|m| m.derived.read_bps).sum();
-        let total_write: f64 = filtered.iter().map(|m| m.derived.write_bps).sum();
-        let total_ops: f64 = filtered.iter().map(|m| m.derived.ops_per_sec).sum();
-        let total_rtt = filtered.iter().filter_map(|m| m.derived.avg_rtt_ms).sum::<f64>();
-        let rtt_count = filtered.iter().filter(|m| m.derived.avg_rtt_ms.is_some()).count();
+        self.update_global_history(&snap);
+        self.update_mount_history(&snap.mounts);
+        self.cached_servers = Self::aggregate_servers_from(&snap.mounts, self.sort);
+        self.update_server_history();
+        self.cached_visible_idx = self.compute_visible_indices(&snap.mounts);
+        self.last_sample = Some(snap.ts);
+        self.snapshot = Some(snap);
+        self.clamp_selection();
+    }
+
+    fn update_global_history(&mut self, snap: &Snapshot) {
+        let mut total_read = 0.0;
+        let mut total_write = 0.0;
+        let mut total_ops = 0.0;
+        let mut total_rtt = 0.0;
+        let mut rtt_count = 0usize;
+        for m in snap.mounts.iter().filter(|m| self.matches_filter(m)) {
+            total_read += m.derived.read_bps;
+            total_write += m.derived.write_bps;
+            total_ops += m.derived.ops_per_sec;
+            if let Some(rtt) = m.derived.avg_rtt_ms {
+                total_rtt += rtt;
+                rtt_count += 1;
+            }
+        }
         self.read_hist.push(total_read);
         self.write_hist.push(total_write);
         self.ops_hist.push(total_ops);
+        self.rtt_hist.push(if rtt_count > 0 { total_rtt / rtt_count as f64 } else { 0.0 });
         if snap.dt_secs > 0.0 && snap.dt_secs.is_finite() {
             self.cumulative_read_bytes += total_read * snap.dt_secs;
             self.cumulative_write_bytes += total_write * snap.dt_secs;
         }
-        self.rtt_hist.push(if rtt_count > 0 { total_rtt / (rtt_count as f64) } else { 0.0 });
-        for m in &snap.mounts {
+    }
+
+    fn update_mount_history(&mut self, mounts: &[MountView]) {
+        for m in mounts {
             let h = self
                 .mount_histories
                 .entry(m.counters.mountpoint.clone())
                 .or_insert_with(|| MountHistory::new(self.history_len));
             h.read_bps.push(m.derived.read_bps);
             h.write_bps.push(m.derived.write_bps);
-            let read_lat = m
-                .derived
-                .per_op
-                .iter()
-                .find(|o| o.op == "READ")
-                .and_then(|o| o.avg_rtt_ms)
-                .unwrap_or(0.0);
-            let write_lat = m
-                .derived
-                .per_op
-                .iter()
-                .find(|o| o.op == "WRITE")
-                .and_then(|o| o.avg_rtt_ms)
-                .unwrap_or(0.0);
-            h.read_lat_ms.push(read_lat);
-            h.write_lat_ms.push(write_lat);
+            h.read_lat_ms.push(op_lat(&m.derived.per_op, "READ"));
+            h.write_lat_ms.push(op_lat(&m.derived.per_op, "WRITE"));
         }
-        // Aggregate per-server totals and push to server histories
-        let servers = Self::aggregate_servers_from(&snap.mounts, self.sort);
-        for srv in &servers {
+    }
+
+    fn update_server_history(&mut self) {
+        for srv in &self.cached_servers {
             let h = self
                 .server_histories
                 .entry(srv.addr)
@@ -248,44 +268,54 @@ impl App {
             h.ops.push(srv.ops_per_sec);
             h.rtt_ms.push(srv.avg_rtt_ms.unwrap_or(0.0));
         }
-        self.last_sample = Some(snap.ts);
-        self.snapshot = Some(snap);
-        let max = self.visible_mounts().len().saturating_sub(1);
-        self.selected = self.selected.min(max);
-        let server_max = servers.len().saturating_sub(1);
-        self.server_selected = self.server_selected.min(server_max);
+    }
+
+    fn compute_visible_indices(&self, mounts: &[MountView]) -> Vec<usize> {
+        let mut idx: Vec<usize> = mounts
+            .iter()
+            .enumerate()
+            .filter(|(_, m)| self.matches_filter(m))
+            .map(|(i, _)| i)
+            .collect();
+        idx.sort_by(|&a, &b| self.compare_mounts(&mounts[a], &mounts[b]));
+        idx
+    }
+
+    fn clamp_selection(&mut self) {
+        self.selected = self.selected.min(self.cached_visible_idx.len().saturating_sub(1));
+        self.server_selected = self.server_selected.min(self.cached_servers.len().saturating_sub(1));
+    }
+
+    /// Cycle the sort key. Re-sorts the cached visible mounts and server
+    /// aggregates so the next render reflects the new order without waiting
+    /// for the next sample.
+    pub fn cycle_sort(&mut self) {
+        self.sort = self.sort.next();
+        let sort = self.sort;
+        if let Some(snap) = self.snapshot.as_ref() {
+            let mounts = &snap.mounts;
+            self.cached_visible_idx
+                .sort_by(|&a, &b| compare_mounts_by(&mounts[a], &mounts[b], sort));
+        }
+        sort_servers(&mut self.cached_servers, sort);
     }
 
     pub fn visible_mounts(&self) -> Vec<&MountView> {
-        let mut v: Vec<&MountView> = self
-            .snapshot
-            .as_ref()
-            .map(|s| s.mounts.iter().collect())
-            .unwrap_or_default();
-
-        if !self.filter.is_empty() {
-            v.retain(|m| self.matches_filter(m));
-        }
-
-        v.sort_by(|a, b| self.compare_mounts(a, b));
-        v
+        let Some(snap) = self.snapshot.as_ref() else { return Vec::new() };
+        self.cached_visible_idx
+            .iter()
+            .filter_map(|&i| snap.mounts.get(i))
+            .collect()
     }
 
     fn compare_mounts(&self, a: &MountView, b: &MountView) -> Ordering {
-        match self.sort {
-            SortKey::Read => b.derived.read_bps.partial_cmp(&a.derived.read_bps).unwrap_or(Ordering::Equal),
-            SortKey::Write => b.derived.write_bps.partial_cmp(&a.derived.write_bps).unwrap_or(Ordering::Equal),
-            SortKey::Ops => b.derived.ops_per_sec.partial_cmp(&a.derived.ops_per_sec).unwrap_or(Ordering::Equal),
-            SortKey::Rtt => b.derived.avg_rtt_ms.partial_cmp(&a.derived.avg_rtt_ms).unwrap_or(Ordering::Equal),
-            SortKey::Exe => b.derived.avg_exe_ms.partial_cmp(&a.derived.avg_exe_ms).unwrap_or(Ordering::Equal),
-            SortKey::Mount => a.counters.mountpoint.cmp(&b.counters.mountpoint),
-            SortKey::Nconnect => b.counters.nconnect.cmp(&a.counters.nconnect),
-            SortKey::ObsConn => b.derived.observed_conns.cmp(&a.derived.observed_conns),
-        }
+        compare_mounts_by(a, b, self.sort)
     }
 
     pub fn selected_mount(&self) -> Option<&MountView> {
-        self.visible_mounts().get(self.selected).copied()
+        let snap = self.snapshot.as_ref()?;
+        let &idx = self.cached_visible_idx.get(self.selected)?;
+        snap.mounts.get(idx)
     }
 
     pub fn selected_mount_history(&self) -> Option<&MountHistory> {
@@ -300,111 +330,18 @@ impl App {
         }
         let mut servers: Vec<ServerAgg> = by_addr
             .into_iter()
-            .map(|(addr, group)| {
-                let read_bps: f64 = group.iter().map(|m| m.derived.read_bps).sum();
-                let write_bps: f64 = group.iter().map(|m| m.derived.write_bps).sum();
-                let ops_per_sec: f64 = group.iter().map(|m| m.derived.ops_per_sec).sum();
-                let observed_conns: u64 = group.iter().map(|m| m.derived.observed_conns).sum();
-
-                // Ops-weighted average latency
-                let avg_rtt_ms = {
-                    let (weighted_sum, total_weight) = group.iter().fold((0.0, 0.0), |(ws, tw), m| {
-                        if let Some(rtt) = m.derived.avg_rtt_ms {
-                            (ws + rtt * m.derived.ops_per_sec, tw + m.derived.ops_per_sec)
-                        } else {
-                            (ws, tw)
-                        }
-                    });
-                    if total_weight > 0.0 { Some(weighted_sum / total_weight) } else { None }
-                };
-                let avg_exe_ms = {
-                    let (weighted_sum, total_weight) = group.iter().fold((0.0, 0.0), |(ws, tw), m| {
-                        if let Some(exe) = m.derived.avg_exe_ms {
-                            (ws + exe * m.derived.ops_per_sec, tw + m.derived.ops_per_sec)
-                        } else {
-                            (ws, tw)
-                        }
-                    });
-                    if total_weight > 0.0 { Some(weighted_sum / total_weight) } else { None }
-                };
-
-                // Merge per-op stats across mounts
-                let mut op_map: HashMap<String, (f64, f64, f64, f64, f64, f64)> = HashMap::new();
-                // (ops_sum, bytes_sum, rtt_weighted_sum, rtt_weight, exe_weighted_sum, exe_weight)
-                for m in &group {
-                    for op in &m.derived.per_op {
-                        let e = op_map.entry(op.op.clone()).or_default();
-                        e.0 += op.ops_per_sec;
-                        e.1 += op.bytes_per_sec;
-                        if let Some(rtt) = op.avg_rtt_ms {
-                            e.2 += rtt * op.ops_per_sec;
-                            e.3 += op.ops_per_sec;
-                        }
-                        if let Some(exe) = op.avg_exe_ms {
-                            e.4 += exe * op.ops_per_sec;
-                            e.5 += op.ops_per_sec;
-                        }
-                    }
-                }
-                let total_ops_for_share: f64 = op_map.values().map(|v| v.0).sum();
-                let mut per_op: Vec<OpDerived> = op_map
-                    .into_iter()
-                    .map(|(op, (ops_sum, bytes_sum, rtt_ws, rtt_w, exe_ws, exe_w))| OpDerived {
-                        op,
-                        ops_per_sec: ops_sum,
-                        bytes_per_sec: bytes_sum,
-                        share_pct: if total_ops_for_share > 0.0 { ops_sum / total_ops_for_share * 100.0 } else { 0.0 },
-                        avg_rtt_ms: if rtt_w > 0.0 { Some(rtt_ws / rtt_w) } else { None },
-                        avg_exe_ms: if exe_w > 0.0 { Some(exe_ws / exe_w) } else { None },
-                    })
-                    .collect();
-                per_op.sort_by(|a, b| b.ops_per_sec.partial_cmp(&a.ops_per_sec).unwrap_or(Ordering::Equal));
-
-                let hostname = group
-                    .first()
-                    .and_then(|m| host_from_device(&m.counters.device))
-                    .unwrap_or("unknown")
-                    .to_string();
-
-                let mounts: Vec<String> = group.iter().map(|m| m.counters.mountpoint.clone()).collect();
-
-                ServerAgg {
-                    addr,
-                    hostname,
-                    mounts,
-                    read_bps,
-                    write_bps,
-                    ops_per_sec,
-                    avg_rtt_ms,
-                    avg_exe_ms,
-                    observed_conns,
-                    per_op,
-                }
-            })
+            .map(|(addr, group)| build_server_agg(addr, &group))
             .collect();
-
-        servers.sort_by(|a, b| match sort {
-            SortKey::Read => b.read_bps.partial_cmp(&a.read_bps).unwrap_or(Ordering::Equal),
-            SortKey::Write => b.write_bps.partial_cmp(&a.write_bps).unwrap_or(Ordering::Equal),
-            SortKey::Ops => b.ops_per_sec.partial_cmp(&a.ops_per_sec).unwrap_or(Ordering::Equal),
-            SortKey::Rtt => b.avg_rtt_ms.partial_cmp(&a.avg_rtt_ms).unwrap_or(Ordering::Equal),
-            SortKey::Exe => b.avg_exe_ms.partial_cmp(&a.avg_exe_ms).unwrap_or(Ordering::Equal),
-            SortKey::ObsConn => b.observed_conns.cmp(&a.observed_conns),
-            _ => b.ops_per_sec.partial_cmp(&a.ops_per_sec).unwrap_or(Ordering::Equal),
-        });
-
+        sort_servers(&mut servers, sort);
         servers
     }
 
-    pub fn aggregate_servers(&self) -> Vec<ServerAgg> {
-        match self.snapshot.as_ref() {
-            Some(snap) => Self::aggregate_servers_from(&snap.mounts, self.sort),
-            None => Vec::new(),
-        }
+    pub fn aggregate_servers(&self) -> &[ServerAgg] {
+        &self.cached_servers
     }
 
-    pub fn selected_server(&self) -> Option<ServerAgg> {
-        self.aggregate_servers().into_iter().nth(self.server_selected)
+    pub fn selected_server(&self) -> Option<&ServerAgg> {
+        self.cached_servers.get(self.server_selected)
     }
 
     pub fn selected_server_history(&self) -> Option<&ServerHistory> {
@@ -427,10 +364,129 @@ impl App {
     }
 
     fn matches_filter(&self, m: &MountView) -> bool {
-        if self.filter.is_empty() {
+        if self.filter_lower.is_empty() {
             return true;
         }
-        let q = self.filter.to_lowercase();
-        m.counters.mountpoint.to_lowercase().contains(&q) || m.counters.device.to_lowercase().contains(&q)
+        let q = &self.filter_lower;
+        m.counters.mountpoint.to_lowercase().contains(q) || m.counters.device.to_lowercase().contains(q)
     }
+}
+
+fn compare_mounts_by(a: &MountView, b: &MountView, sort: SortKey) -> Ordering {
+    match sort {
+        SortKey::Read => b.derived.read_bps.partial_cmp(&a.derived.read_bps).unwrap_or(Ordering::Equal),
+        SortKey::Write => b.derived.write_bps.partial_cmp(&a.derived.write_bps).unwrap_or(Ordering::Equal),
+        SortKey::Ops => b.derived.ops_per_sec.partial_cmp(&a.derived.ops_per_sec).unwrap_or(Ordering::Equal),
+        SortKey::Rtt => b.derived.avg_rtt_ms.partial_cmp(&a.derived.avg_rtt_ms).unwrap_or(Ordering::Equal),
+        SortKey::Exe => b.derived.avg_exe_ms.partial_cmp(&a.derived.avg_exe_ms).unwrap_or(Ordering::Equal),
+        SortKey::Mount => a.counters.mountpoint.cmp(&b.counters.mountpoint),
+        SortKey::Nconnect => b.counters.nconnect.cmp(&a.counters.nconnect),
+        SortKey::ObsConn => b.derived.observed_conns.cmp(&a.derived.observed_conns),
+    }
+}
+
+fn op_lat(per_op: &[OpDerived], op_name: &str) -> f64 {
+    per_op
+        .iter()
+        .find(|o| o.op == op_name)
+        .and_then(|o| o.avg_rtt_ms)
+        .unwrap_or(0.0)
+}
+
+/// Ops-weighted mean: each (value, weight) contributes value*weight to the sum
+/// when value is Some. Returns None if the total weight is zero.
+fn ops_weighted_mean<I>(items: I) -> Option<f64>
+where
+    I: IntoIterator<Item = (Option<f64>, f64)>,
+{
+    let (sum, weight) = items.into_iter().fold((0.0_f64, 0.0_f64), |(s, w), (v, wt)| match v {
+        Some(x) => (s + x * wt, w + wt),
+        None => (s, w),
+    });
+    (weight > 0.0).then_some(sum / weight)
+}
+
+#[derive(Default)]
+struct OpAccum {
+    ops_sum: f64,
+    bytes_sum: f64,
+    rtt_weighted_sum: f64,
+    rtt_weight: f64,
+    exe_weighted_sum: f64,
+    exe_weight: f64,
+}
+
+fn build_server_agg(addr: Option<IpAddr>, group: &[&MountView]) -> ServerAgg {
+    let read_bps: f64 = group.iter().map(|m| m.derived.read_bps).sum();
+    let write_bps: f64 = group.iter().map(|m| m.derived.write_bps).sum();
+    let ops_per_sec: f64 = group.iter().map(|m| m.derived.ops_per_sec).sum();
+    let observed_conns: u64 = group.iter().map(|m| m.derived.observed_conns).sum();
+
+    let avg_rtt_ms = ops_weighted_mean(group.iter().map(|m| (m.derived.avg_rtt_ms, m.derived.ops_per_sec)));
+    let avg_exe_ms = ops_weighted_mean(group.iter().map(|m| (m.derived.avg_exe_ms, m.derived.ops_per_sec)));
+
+    let mut op_map: HashMap<String, OpAccum> = HashMap::new();
+    for m in group {
+        for op in &m.derived.per_op {
+            let e = op_map.entry(op.op.clone()).or_default();
+            e.ops_sum += op.ops_per_sec;
+            e.bytes_sum += op.bytes_per_sec;
+            if let Some(rtt) = op.avg_rtt_ms {
+                e.rtt_weighted_sum += rtt * op.ops_per_sec;
+                e.rtt_weight += op.ops_per_sec;
+            }
+            if let Some(exe) = op.avg_exe_ms {
+                e.exe_weighted_sum += exe * op.ops_per_sec;
+                e.exe_weight += op.ops_per_sec;
+            }
+        }
+    }
+    let total_ops_for_share: f64 = op_map.values().map(|v| v.ops_sum).sum();
+    let mut per_op: Vec<OpDerived> = op_map
+        .into_iter()
+        .map(|(op, a)| OpDerived {
+            op,
+            ops_per_sec: a.ops_sum,
+            bytes_per_sec: a.bytes_sum,
+            share_pct: if total_ops_for_share > 0.0 { a.ops_sum / total_ops_for_share * 100.0 } else { 0.0 },
+            avg_rtt_ms: (a.rtt_weight > 0.0).then_some(a.rtt_weighted_sum / a.rtt_weight),
+            avg_exe_ms: (a.exe_weight > 0.0).then_some(a.exe_weighted_sum / a.exe_weight),
+        })
+        .collect();
+    per_op.sort_by(|a, b| b.ops_per_sec.partial_cmp(&a.ops_per_sec).unwrap_or(Ordering::Equal));
+
+    let hostname = group
+        .first()
+        .and_then(|m| host_from_device(&m.counters.device))
+        .unwrap_or("unknown")
+        .to_string();
+    let mounts: Vec<String> = group.iter().map(|m| m.counters.mountpoint.clone()).collect();
+
+    ServerAgg {
+        addr,
+        hostname,
+        mounts,
+        read_bps,
+        write_bps,
+        ops_per_sec,
+        avg_rtt_ms,
+        avg_exe_ms,
+        observed_conns,
+        per_op,
+    }
+}
+
+fn sort_servers(servers: &mut [ServerAgg], sort: SortKey) {
+    servers.sort_by(|a, b| match sort {
+        SortKey::Read => b.read_bps.partial_cmp(&a.read_bps).unwrap_or(Ordering::Equal),
+        SortKey::Write => b.write_bps.partial_cmp(&a.write_bps).unwrap_or(Ordering::Equal),
+        SortKey::Ops => b.ops_per_sec.partial_cmp(&a.ops_per_sec).unwrap_or(Ordering::Equal),
+        SortKey::Rtt => b.avg_rtt_ms.partial_cmp(&a.avg_rtt_ms).unwrap_or(Ordering::Equal),
+        SortKey::Exe => b.avg_exe_ms.partial_cmp(&a.avg_exe_ms).unwrap_or(Ordering::Equal),
+        SortKey::ObsConn => b.observed_conns.cmp(&a.observed_conns),
+        // No meaningful per-server ordering for Mount/Nconnect; fall back to Ops.
+        SortKey::Mount | SortKey::Nconnect => {
+            b.ops_per_sec.partial_cmp(&a.ops_per_sec).unwrap_or(Ordering::Equal)
+        }
+    });
 }
