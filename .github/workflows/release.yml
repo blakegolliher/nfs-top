@@ -32,6 +32,7 @@ jobs:
               curl -sSf https://sh.rustup.rs | sh -s -- -y \
                 --default-toolchain stable --profile minimal
               source "$HOME/.cargo/env"
+              rustup component add rustfmt
 
               cargo build --release --features ebpf
               strip --strip-unneeded target/release/nfs-top
