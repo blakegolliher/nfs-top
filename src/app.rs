@@ -15,6 +15,7 @@ pub enum Tab {
     Overview,
     RpcMix,
     Trends,
+    Hist,
     Connections,
     Raw,
     Servers,
@@ -22,15 +23,16 @@ pub enum Tab {
 }
 
 impl Tab {
-    pub fn titles() -> [&'static str; 7] {
-        ["Overview", "RPC Mix", "Trends", "Connections", "Raw", "Servers", "Help"]
+    pub fn titles() -> [&'static str; 8] {
+        ["Overview", "RPC Mix", "Trends", "Hist", "Connections", "Raw", "Servers", "Help"]
     }
 
     pub fn next(self) -> Self {
         match self {
             Tab::Overview => Tab::RpcMix,
             Tab::RpcMix => Tab::Trends,
-            Tab::Trends => Tab::Connections,
+            Tab::Trends => Tab::Hist,
+            Tab::Hist => Tab::Connections,
             Tab::Connections => Tab::Raw,
             Tab::Raw => Tab::Servers,
             Tab::Servers => Tab::Help,
@@ -43,7 +45,8 @@ impl Tab {
             Tab::Overview => Tab::Help,
             Tab::RpcMix => Tab::Overview,
             Tab::Trends => Tab::RpcMix,
-            Tab::Connections => Tab::Trends,
+            Tab::Hist => Tab::Trends,
+            Tab::Connections => Tab::Hist,
             Tab::Raw => Tab::Connections,
             Tab::Servers => Tab::Raw,
             Tab::Help => Tab::Servers,
@@ -55,10 +58,11 @@ impl Tab {
             Tab::Overview => 0,
             Tab::RpcMix => 1,
             Tab::Trends => 2,
-            Tab::Connections => 3,
-            Tab::Raw => 4,
-            Tab::Servers => 5,
-            Tab::Help => 6,
+            Tab::Hist => 3,
+            Tab::Connections => 4,
+            Tab::Raw => 5,
+            Tab::Servers => 6,
+            Tab::Help => 7,
         }
     }
 }

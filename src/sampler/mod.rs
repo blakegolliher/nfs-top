@@ -12,6 +12,9 @@ use crate::model::derive::host_from_device;
 use crate::model::types::{MountCounters, MountDerived, MountView, OpDerived, Snapshot};
 
 pub mod dns;
+#[cfg(feature = "ebpf")]
+pub mod ebpf;
+pub mod hist;
 pub mod mounts;
 pub mod mountstats;
 pub mod rpc;
@@ -29,6 +32,18 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
     thread::spawn(move || {
         let mut prev: Option<(SystemTime, Vec<MountCounters>)> = None;
         let mut dns_cache = dns::DnsCache::new(Duration::from_secs(60));
+
+        // Stash the eBPF startup outcome here. We can't print to stderr
+        // from this thread because the TUI has already taken the alt
+        // screen — that would corrupt rendered frames. Instead we route
+        // through `partial_errors` on the very first snapshot so the
+        // status bar surfaces it normally.
+        #[cfg(feature = "ebpf")]
+        let (mut enricher, mut pending_ebpf_error): (Option<ebpf::Enricher>, Option<String>) =
+            match ebpf::Enricher::try_new() {
+                Ok(e) => (Some(e), None),
+                Err(e) => (None, Some(format!("ebpf disabled: {e:#}"))),
+            };
 
         loop {
             let now = SystemTime::now();
@@ -101,6 +116,29 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
             }
 
             let prev_counters = views.iter().map(|v| v.counters.clone()).collect::<Vec<_>>();
+
+            #[cfg(feature = "ebpf")]
+            let bpf = match enricher.as_mut() {
+                Some(e) => match e.snapshot() {
+                    Ok(b) => b,
+                    Err(err) => {
+                        partial_errors.push(format!("ebpf: {err:#}"));
+                        None
+                    }
+                },
+                None => None,
+            };
+            #[cfg(feature = "ebpf")]
+            let bpf_attached = enricher.is_some();
+            #[cfg(feature = "ebpf")]
+            if let Some(msg) = pending_ebpf_error.take() {
+                partial_errors.push(msg);
+            }
+            #[cfg(not(feature = "ebpf"))]
+            let bpf: Option<crate::model::types::BpfLatency> = None;
+            #[cfg(not(feature = "ebpf"))]
+            let bpf_attached = false;
+
             let snap = Snapshot {
                 ts: now,
                 dt_secs,
@@ -108,6 +146,8 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
                 rpc,
                 raw_tcp_matches: sockets.raw_matches,
                 partial_errors,
+                bpf,
+                bpf_attached,
             };
 
             let _ = tx.send(Ok(snap));
@@ -193,6 +233,7 @@ fn derive_rates(
         observed_conns,
         observed_by_ip,
         per_op,
+        bpf: None,
     }
 }
 

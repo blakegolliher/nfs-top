@@ -7,6 +7,7 @@ use ratatui::Frame;
 use crate::app::{App, Tab};
 
 pub mod help;
+pub mod hist;
 pub mod latency;
 pub mod overview;
 pub mod raw;
@@ -38,6 +39,7 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
         Tab::Overview => overview::draw(f, areas[1], app),
         Tab::RpcMix => rpc_mix::draw(f, areas[1], app),
         Tab::Trends => latency::draw(f, areas[1], app),
+        Tab::Hist => hist::draw(f, areas[1], app),
         Tab::Connections => transport::draw(f, areas[1], app),
         Tab::Raw => raw::draw(f, areas[1], app),
         Tab::Servers => servers::draw(f, areas[1], app),
