@@ -12,6 +12,10 @@ default = ["crossterm"]
 crossterm = ["dep:crossterm", "ratatui/crossterm"]
 termion = ["dep:termion", "ratatui/termion"]
 termwiz = ["dep:termwiz", "ratatui/termwiz"]
+# Optional eBPF latency enricher. Requires Linux 5.14+, BTF, clang at build
+# time, and CAP_BPF (or root) at runtime. Off by default; nfs-top is fully
+# functional without it.
+ebpf = ["dep:libbpf-rs", "dep:libbpf-cargo"]
 
 [dependencies]
 anyhow = "1.0"
@@ -21,3 +25,8 @@ ratatui = { version = "0.29", default-features = false }
 crossterm = { version = "0.28", optional = true }
 termion = { version = "3", optional = true }
 termwiz = { version = "0.23", optional = true }
+
+libbpf-rs = { version = "0.24", optional = true }
+
+[build-dependencies]
+libbpf-cargo = { version = "0.24", optional = true }

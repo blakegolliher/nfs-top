@@ -12,6 +12,8 @@ use crate::model::derive::host_from_device;
 use crate::model::types::{MountCounters, MountDerived, MountView, OpDerived, Snapshot};
 
 pub mod dns;
+#[cfg(feature = "ebpf")]
+pub mod ebpf;
 pub mod mounts;
 pub mod mountstats;
 pub mod rpc;
@@ -193,6 +195,7 @@ fn derive_rates(
         observed_conns,
         observed_by_ip,
         per_op,
+        bpf: None,
     }
 }
 

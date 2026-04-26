@@ -56,6 +56,45 @@ pub struct MountDerived {
     pub observed_conns: u64,
     pub observed_by_ip: Vec<(IpAddr, u64)>,
     pub per_op: Vec<OpDerived>,
+    pub bpf: Option<BpfLatency>,
+}
+
+/// Bucket-aligned latency distribution.
+///
+/// Buckets are powers of two in nanoseconds: bucket `i` covers
+/// `[2^i, 2^(i+1))`. Reported percentiles are upper bounds — the value
+/// returned for `p99_ns` is the upper edge of the bucket containing the
+/// 99th percentile sample, so the *true* p99 is at most that value.
+#[derive(Debug, Clone, Default)]
+pub struct LatencyDist {
+    pub samples: u64,
+    pub p50_ns: u64,
+    pub p90_ns: u64,
+    pub p99_ns: u64,
+    pub p999_ns: u64,
+    pub p9999_ns: u64,
+    pub p99999_ns: u64,
+    pub max_ns: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct BpfOpLatency {
+    pub op: String,
+    pub dist: LatencyDist,
+}
+
+/// Optional eBPF-derived latency snapshot for a mount.
+///
+/// Populated only when the `ebpf` feature is built in and the kernel-side
+/// probes successfully attached. A `None` value on `MountDerived.bpf` means
+/// "no data" — never "zero samples". Consumers must treat this as an
+/// optional decoration on top of the existing /proc-derived fields.
+#[derive(Debug, Clone, Default)]
+pub struct BpfLatency {
+    /// Per-op latency distributions, sorted by descending sample count.
+    pub per_op: Vec<BpfOpLatency>,
+    /// Total samples folded across all ops, for the bottom-bar indicator.
+    pub total_samples: u64,
 }
 
 #[derive(Debug, Clone)]
