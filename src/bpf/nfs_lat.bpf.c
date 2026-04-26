@@ -67,13 +67,20 @@ static __always_inline int record_done(__u64 key)
 		.op_id = v->op_id,
 		.bucket = log2_bucket(lat),
 	};
+	/* Race-safe cold-start: two CPUs landing on a never-seen
+	 * (op_id, bucket) both BPF_NOEXIST(zero); whichever loses still
+	 * sees the entry on the second lookup, so neither sample is lost. */
 	__u64 *cnt = bpf_map_lookup_elem(&hist, &hk);
-	if (cnt) {
-		__sync_fetch_and_add(cnt, 1);
-	} else {
-		__u64 one = 1;
-		bpf_map_update_elem(&hist, &hk, &one, BPF_NOEXIST);
+	if (!cnt) {
+		__u64 zero = 0;
+		bpf_map_update_elem(&hist, &hk, &zero, BPF_NOEXIST);
+		cnt = bpf_map_lookup_elem(&hist, &hk);
+		if (!cnt) {
+			bpf_map_delete_elem(&inflight, &key);
+			return 0;
+		}
 	}
+	__sync_fetch_and_add(cnt, 1);
 	bpf_map_delete_elem(&inflight, &key);
 	return 0;
 }
@@ -91,7 +98,7 @@ int handle_read_done(struct bpf_raw_tracepoint_args *ctx)
 	return record_done(ctx->args[1]);
 }
 
-/* Write: init has 1 arg (hdr); done has 3 args (task, hdr, status). */
+/* Write: init has 1 arg (hdr); done has 2 args (task, hdr). */
 SEC("raw_tracepoint/nfs_initiate_write")
 int handle_write_init(struct bpf_raw_tracepoint_args *ctx)
 {

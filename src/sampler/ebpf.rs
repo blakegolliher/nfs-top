@@ -110,7 +110,7 @@ impl Enricher {
                 continue;
             }
             let bucket = (bucket as usize).min(BUCKETS - 1);
-            per_op.entry(op_id).or_insert([0u64; BUCKETS])[bucket] += delta;
+            per_op.entry(op_id).or_insert_with(|| [0u64; BUCKETS])[bucket] += delta;
             total_samples = total_samples.saturating_add(delta);
         }
 
@@ -123,6 +123,7 @@ impl Enricher {
             .map(|(op_id, buckets)| BpfOpLatency {
                 op: op_name(op_id).to_string(),
                 dist: dist_from_buckets(&buckets),
+                buckets: buckets.to_vec(),
             })
             .collect();
         out.sort_by(|a, b| b.dist.samples.cmp(&a.dist.samples));

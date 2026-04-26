@@ -12,7 +12,7 @@ use ratatui::widgets::{Cell, Paragraph, Row, Table};
 use ratatui::Frame;
 
 use crate::app::App;
-use crate::model::types::{BpfLatency, BpfOpLatency, LatencyDist};
+use crate::model::types::{BpfLatency, BpfOpLatency};
 use crate::ui::{panel, ACCENT_A};
 
 pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
@@ -29,25 +29,43 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
     };
 
+    // 1 header + N data rows + sparkline (2 lines) + totals (1 line).
+    let table_h = (bpf.per_op.len() as u16) + 1;
     let parts = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length((bpf.per_op.len() as u16) + 3), Constraint::Min(3)])
+        .constraints([
+            Constraint::Length(table_h),
+            Constraint::Length(1),
+            Constraint::Min(3),
+        ])
         .split(inner);
 
     f.render_widget(percentile_table(bpf), parts[0]);
+    let totals = format!("{} samples this tick", fmt_count(bpf.total_samples));
+    f.render_widget(
+        Paragraph::new(totals).style(Style::default().fg(Color::DarkGray)),
+        parts[1],
+    );
 
     if let Some(top) = bpf.per_op.first() {
-        f.render_widget(distribution_line(top), parts[1]);
+        f.render_widget(distribution_line(top), parts[2]);
     }
 }
 
-fn empty_message(_app: &App) -> Line<'static> {
-    let cfg_hint = if cfg!(feature = "ebpf") {
-        "eBPF backend not active — needs CAP_BPF and a kernel with NFS BTF (RHEL 9+). Run with sudo or `setcap cap_bpf,cap_sys_resource=ep`."
-    } else {
+fn empty_message(app: &App) -> Line<'static> {
+    let attached = app
+        .snapshot
+        .as_ref()
+        .map(|s| s.bpf_attached)
+        .unwrap_or(false);
+    let msg = if !cfg!(feature = "ebpf") {
         "Built without --features=ebpf. Rebuild with `cargo build --features=ebpf` to enable per-op latency histograms."
+    } else if attached {
+        "eBPF probes attached — waiting for NFS RPC traffic on this host."
+    } else {
+        "eBPF backend not active — needs CAP_BPF and a kernel with NFS BTF (RHEL 9+). Run with sudo or `setcap cap_bpf,cap_sys_resource=ep`. (Check the status bar for the load error.)"
     };
-    Line::from(vec![Span::styled(cfg_hint, Style::default().fg(Color::Gray))])
+    Line::from(vec![Span::styled(msg, Style::default().fg(Color::Gray))])
 }
 
 fn percentile_table(bpf: &BpfLatency) -> Table<'static> {
@@ -57,10 +75,6 @@ fn percentile_table(bpf: &BpfLatency) -> Table<'static> {
     let header = Row::new(header_cells).height(1);
 
     let rows: Vec<Row> = bpf.per_op.iter().map(row_for_op).collect();
-
-    let totals_cell = format!("{} samples this tick", fmt_count(bpf.total_samples));
-    let footer = Row::new(vec![Cell::from(totals_cell)])
-        .style(Style::default().fg(Color::DarkGray));
 
     let widths = [
         Constraint::Length(8),
@@ -74,9 +88,7 @@ fn percentile_table(bpf: &BpfLatency) -> Table<'static> {
         Constraint::Length(9),
     ];
 
-    Table::new(rows.into_iter().chain(std::iter::once(footer)), widths)
-        .header(header)
-        .column_spacing(1)
+    Table::new(rows, widths).header(header).column_spacing(1)
 }
 
 fn row_for_op(op: &BpfOpLatency) -> Row<'static> {
@@ -94,15 +106,16 @@ fn row_for_op(op: &BpfOpLatency) -> Row<'static> {
     ])
 }
 
-/// One-line "shape" of the highest-throughput op's distribution. Each
-/// character is a power-of-two bucket whose height encodes log(count).
+/// Shape of the highest-throughput op's distribution. One character per
+/// log2 bucket, height encodes log(count) so a single dominant bucket
+/// renders flat-topped while a long tail spreads visibly to the right.
 fn distribution_line(top: &BpfOpLatency) -> Paragraph<'static> {
-    let (chars, low_edge_ns, high_edge_ns) = bucket_sparkline(&top.dist);
+    let (chars, low_idx, high_idx) = bucket_sparkline(&top.buckets);
     let header = format!(
         "{} distribution  ({} → {})",
         top.op,
-        fmt_ns(low_edge_ns),
-        fmt_ns(high_edge_ns),
+        fmt_ns(bucket_lower_ns(low_idx)),
+        fmt_ns(bucket_upper_ns(high_idx)),
     );
     let lines = vec![
         Line::from(Span::styled(header, Style::default().fg(Color::Gray))),
@@ -111,33 +124,47 @@ fn distribution_line(top: &BpfOpLatency) -> Paragraph<'static> {
     Paragraph::new(lines)
 }
 
-/// We don't have raw bucket counts on `LatencyDist` (only percentiles).
-/// Render a synthetic sparkline using the percentile shape: each character
-/// is the lower-bound bucket value at p50/p90/p99/p99.9/p99.99/p99.999/max,
-/// height encodes its rank.
-fn bucket_sparkline(dist: &LatencyDist) -> (String, u64, u64) {
+/// Build a sparkline from raw per-bucket counts. Trims to the populated
+/// window `[lo, hi]` so the visualization scales to where the samples
+/// actually are. Heights are log2(count + 1) normalized to the glyph
+/// range — a single hot bucket reads tall, a flat distribution reads
+/// uniform, a bimodal one shows two visible peaks.
+fn bucket_sparkline(buckets: &[u64]) -> (String, usize, usize) {
     const SPARK: [char; 8] = [' ', '▁', '▂', '▃', '▄', '▅', '▆', '▇'];
-    let stops = [
-        dist.p50_ns,
-        dist.p90_ns,
-        dist.p99_ns,
-        dist.p999_ns,
-        dist.p9999_ns,
-        dist.p99999_ns,
-        dist.max_ns,
-    ];
-    let s: String = stops
+    let lo = buckets.iter().position(|&c| c > 0).unwrap_or(0);
+    let hi = buckets.iter().rposition(|&c| c > 0).unwrap_or(lo);
+    let max = buckets[lo..=hi].iter().copied().max().unwrap_or(1).max(1);
+    let max_log = ((max + 1) as f64).log2();
+    let s: String = buckets[lo..=hi]
         .iter()
-        .enumerate()
-        .map(|(i, &ns)| {
-            if ns == 0 { return ' '; }
-            let h = ((i + 1) * SPARK.len() / stops.len()).min(SPARK.len() - 1);
-            SPARK[h]
+        .map(|&c| {
+            if c == 0 {
+                return ' ';
+            }
+            let scaled = ((c + 1) as f64).log2() / max_log;
+            let h = (scaled * (SPARK.len() as f64 - 1.0)).round() as usize;
+            SPARK[h.min(SPARK.len() - 1).max(1)]
         })
         .collect();
-    let lo = stops.iter().copied().filter(|n| *n > 0).min().unwrap_or(0);
-    let hi = dist.max_ns;
     (s, lo, hi)
+}
+
+fn bucket_lower_ns(i: usize) -> u64 {
+    if i == 0 {
+        0
+    } else if i >= 63 {
+        1u64 << 63
+    } else {
+        1u64 << i
+    }
+}
+
+fn bucket_upper_ns(i: usize) -> u64 {
+    if i >= 63 {
+        u64::MAX
+    } else {
+        1u64 << (i + 1)
+    }
 }
 
 fn fmt_count(n: u64) -> String {
@@ -182,5 +209,47 @@ mod tests {
         assert_eq!(fmt_count(42), "42");
         assert_eq!(fmt_count(12_345), "12.3K");
         assert_eq!(fmt_count(1_500_000), "1.5M");
+    }
+
+    #[test]
+    fn sparkline_tracks_distribution_shape() {
+        // Single hot bucket: lo == hi, exactly one wide character.
+        let mut single = vec![0u64; 64];
+        single[10] = 1000;
+        let (s, lo, hi) = bucket_sparkline(&single);
+        assert_eq!((lo, hi), (10, 10));
+        assert_eq!(s.chars().count(), 1);
+
+        // Bimodal: two peaks at buckets 8 and 16, valley between.
+        let mut bimodal = vec![0u64; 64];
+        bimodal[8] = 500;
+        bimodal[16] = 500;
+        let (s, lo, hi) = bucket_sparkline(&bimodal);
+        assert_eq!((lo, hi), (8, 16));
+        let chars: Vec<char> = s.chars().collect();
+        assert_eq!(chars.len(), 9);
+        assert_ne!(chars[0], ' ');
+        assert_eq!(chars[1], ' '); // valley
+        assert_ne!(chars[8], ' ');
+
+        // Long tail: heavy at bucket 10, single sample at bucket 20.
+        let mut tail = vec![0u64; 64];
+        tail[10] = 10_000;
+        tail[20] = 1;
+        let (s, lo, hi) = bucket_sparkline(&tail);
+        assert_eq!((lo, hi), (10, 20));
+        let chars: Vec<char> = s.chars().collect();
+        // Tall start, mostly empty middle, short tip at the end.
+        assert_eq!(chars.len(), 11);
+        assert_ne!(chars[0], ' ');
+        assert_ne!(chars[10], ' ');
+    }
+
+    #[test]
+    fn empty_buckets_dont_panic() {
+        let empty = vec![0u64; 64];
+        let (s, lo, hi) = bucket_sparkline(&empty);
+        assert_eq!((lo, hi), (0, 0));
+        assert_eq!(s, " ");
     }
 }

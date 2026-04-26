@@ -1,15 +1,18 @@
 //! Log2-bucket histogram percentile math.
 //!
 //! Buckets are powers of two in nanoseconds: bucket `i` covers
-//! `[2^i, 2^(i+1))`. The reported percentile is the **upper edge** of the
-//! bucket containing the target rank, so the true value is at most that
-//! number. This matches the HDR-histogram convention and gives a
-//! worst-case bound suitable for tail-latency claims.
+//! `[2^i, 2^(i+1))`. As a special case, the BPF binner folds ns=0 into
+//! bucket 0, so bucket 0's effective range is `[0, 2)`. The reported
+//! percentile is the **upper edge** of the bucket containing the target
+//! rank, so the true value is at most that number. This matches the
+//! HDR-histogram convention and gives a worst-case bound suitable for
+//! tail-latency claims.
 
 pub const BUCKETS: usize = 64;
 
-/// Upper edge of bucket `i`, in nanoseconds. Bucket 0 covers `[0, 2)`,
-/// bucket 1 covers `[2, 4)`, bucket 63 covers `[2^63, u64::MAX]`.
+/// Upper edge of bucket `i`, in nanoseconds. Bucket 0 covers `[0, 2)`
+/// (the binner extends `[2^0, 2^1)` to also include ns=0), bucket 1
+/// covers `[2, 4)`, bucket 63 covers `[2^63, u64::MAX]`.
 pub fn bucket_upper_ns(i: usize) -> u64 {
     if i >= 63 {
         u64::MAX

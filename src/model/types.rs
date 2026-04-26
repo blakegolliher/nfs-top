@@ -62,9 +62,11 @@ pub struct MountDerived {
 /// Bucket-aligned latency distribution.
 ///
 /// Buckets are powers of two in nanoseconds: bucket `i` covers
-/// `[2^i, 2^(i+1))`. Reported percentiles are upper bounds — the value
-/// returned for `p99_ns` is the upper edge of the bucket containing the
-/// 99th percentile sample, so the *true* p99 is at most that value.
+/// `[2^i, 2^(i+1))`, with bucket 0 extended to also capture ns=0 since
+/// the BPF binner folds anything below 2 into bucket 0. Reported
+/// percentiles are upper bounds — the value returned for `p99_ns` is
+/// the upper edge of the bucket containing the 99th percentile sample,
+/// so the *true* p99 is at most that value.
 #[derive(Debug, Clone, Default)]
 pub struct LatencyDist {
     pub samples: u64,
@@ -77,10 +79,16 @@ pub struct LatencyDist {
     pub max_ns: u64,
 }
 
+/// Per-op latency entry. Carries both the summarized percentiles and the
+/// raw bucket counts so the UI can render an honest distribution shape
+/// (not just the percentile-based rank pattern).
 #[derive(Debug, Clone)]
 pub struct BpfOpLatency {
     pub op: String,
     pub dist: LatencyDist,
+    /// Per-tick delta count per log2 bucket. `buckets[i]` is the number
+    /// of samples that fell into `[2^i, 2^(i+1))` ns this interval.
+    pub buckets: Vec<u64>,
 }
 
 /// Optional eBPF-derived latency snapshot for a mount.
@@ -142,10 +150,14 @@ pub struct Snapshot {
     pub raw_tcp_matches: Vec<String>,
     pub partial_errors: Vec<String>,
     /// Optional eBPF-derived latency for this interval, aggregated across
-    /// all NFS mounts. None means the eBPF backend is disabled, did not
-    /// load, or produced no samples since the last tick. Per-mount split
-    /// requires s_dev tagging and lands in a follow-up.
+    /// all NFS mounts. `None` means the backend is disabled, did not
+    /// load, or saw no traffic this tick — `bpf_attached` disambiguates.
+    /// Per-mount split requires s_dev tagging and lands in a follow-up.
     pub bpf: Option<BpfLatency>,
+    /// True when the eBPF probes are loaded and attached. Lets the UI
+    /// distinguish "backend down" from "backend up but no traffic this
+    /// tick" — both flow through `bpf == None`.
+    pub bpf_attached: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
