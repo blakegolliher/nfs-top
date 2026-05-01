@@ -28,16 +28,47 @@ use crate::model::types::{BpfLatency, BpfOpLatency, LatencyDist};
 use crate::sampler::hist::{self, BUCKETS};
 
 /// Op identifiers, in lockstep with `enum nfs_op_id` in src/bpf/nfs_lat.bpf.h.
-pub const OP_OTHER: u16 = 0;
+/// Names match what mountstats prints so users can cross-reference rows
+/// in the Hist tab against /proc/self/mountstats. ID 0 is intentionally
+/// unused so a zero-initialized key is unambiguously invalid; `op_name`
+/// still maps it to "OTHER" via the catchall arm for defensive logging.
 pub const OP_READ: u16 = 1;
 pub const OP_WRITE: u16 = 2;
 pub const OP_COMMIT: u16 = 3;
+pub const OP_GETATTR: u16 = 4;
+pub const OP_SETATTR: u16 = 5;
+pub const OP_LOOKUP: u16 = 6;
+pub const OP_ACCESS: u16 = 7;
+pub const OP_CREATE: u16 = 8;
+pub const OP_REMOVE: u16 = 9;
+pub const OP_RENAME: u16 = 10;
+pub const OP_LINK: u16 = 11;
+pub const OP_SYMLINK: u16 = 12;
+pub const OP_MKDIR: u16 = 13;
+pub const OP_RMDIR: u16 = 14;
+pub const OP_MKNOD: u16 = 15;
+pub const OP_FSYNC: u16 = 16;
+pub const OP_OPEN: u16 = 17;
 
 pub fn op_name(id: u16) -> &'static str {
     match id {
         OP_READ => "READ",
         OP_WRITE => "WRITE",
         OP_COMMIT => "COMMIT",
+        OP_GETATTR => "GETATTR",
+        OP_SETATTR => "SETATTR",
+        OP_LOOKUP => "LOOKUP",
+        OP_ACCESS => "ACCESS",
+        OP_CREATE => "CREATE",
+        OP_REMOVE => "REMOVE",
+        OP_RENAME => "RENAME",
+        OP_LINK => "LINK",
+        OP_SYMLINK => "SYMLINK",
+        OP_MKDIR => "MKDIR",
+        OP_RMDIR => "RMDIR",
+        OP_MKNOD => "MKNOD",
+        OP_FSYNC => "FSYNC",
+        OP_OPEN => "OPEN",
         _ => "OTHER",
     }
 }
@@ -212,6 +243,25 @@ mod tests {
         // Third tick: no advance → no entry produced.
         let out = fold_deltas(&mut prev, vec![(51, OP_READ, 10, 13)]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fold_deltas_handles_non_rw_ops() {
+        // Non-RW ops must round-trip through fold_deltas with their
+        // mountstats-compatible labels, sharing a dev with READ/WRITE.
+        let mut prev: HashMap<(u32, u16, u16), u64> = HashMap::new();
+        let items = vec![
+            (51u32, OP_GETATTR, 8u16, 100u64),
+            (51, OP_LOOKUP, 9, 50),
+            (51, OP_ACCESS, 8, 30),
+            (51, OP_READ, 14, 5),
+        ];
+        let out = fold_deltas(&mut prev, items);
+        let dev = out.get(&51).expect("dev 51");
+        assert_eq!(dev.total_samples, 100 + 50 + 30 + 5);
+        // Sorted by sample count desc.
+        let labels: Vec<&str> = dev.per_op.iter().map(|o| o.op.as_str()).collect();
+        assert_eq!(labels, ["GETATTR", "LOOKUP", "ACCESS", "READ"]);
     }
 
     #[test]

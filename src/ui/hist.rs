@@ -40,14 +40,16 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
 
     let selected_idx = app.selected_bpf_op().map(|(i, _)| i).unwrap_or(0);
 
-    // 1 header + N data rows + sparkline (>=3 lines) + totals (1 line).
+    // 1 header + N data rows + totals (1 line) + sparkline (>=5 lines).
+    // The sparkline floor protects the distribution view on smaller
+    // terminals once the op table grows past the RW-only set.
     let table_h = (bpf.per_op.len() as u16) + 1;
     let parts = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(table_h),
             Constraint::Length(1),
-            Constraint::Min(3),
+            Constraint::Min(5),
         ])
         .split(inner);
 

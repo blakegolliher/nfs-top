@@ -19,15 +19,34 @@ typedef uint32_t __u32;
 typedef uint64_t __u64;
 #endif
 
-/* Operation identifiers. Keep in sync with OP_NAMES in src/sampler/ebpf.rs. */
+/* Operation identifiers. Keep in sync with the OP_* consts in
+ * src/sampler/ebpf.rs and the matching arms in op_name(). Names mirror
+ * what mountstats prints so users can cross-reference Hist-tab rows
+ * against /proc/self/mountstats. OP_FSYNC and OP_OPEN have no
+ * mountstats counterpart (OPEN is NFSv4-only); they're harmless on
+ * mounts where the underlying tracepoint never fires. ID 0 is left
+ * unused so a zero-initialized key is unambiguously invalid. */
 enum nfs_op_id {
-	OP_OTHER  = 0,
-	OP_READ   = 1,
-	OP_WRITE  = 2,
-	OP_COMMIT = 3,
+	OP_READ    = 1,
+	OP_WRITE   = 2,
+	OP_COMMIT  = 3,
+	OP_GETATTR = 4,
+	OP_SETATTR = 5,
+	OP_LOOKUP  = 6,
+	OP_ACCESS  = 7,
+	OP_CREATE  = 8,
+	OP_REMOVE  = 9,
+	OP_RENAME  = 10,
+	OP_LINK    = 11,
+	OP_SYMLINK = 12,
+	OP_MKDIR   = 13,
+	OP_RMDIR   = 14,
+	OP_MKNOD   = 15,
+	OP_FSYNC   = 16,
+	OP_OPEN    = 17,
 };
 
-#define NFS_OP_MAX 4
+#define NFS_OP_MAX 18
 
 /* Histogram key: (dev, op, log2_bucket). bucket = floor(log2(latency_ns)).
  * `dev` is the kernel-side super_block.s_dev (MKDEV(major, minor)); 0 means
