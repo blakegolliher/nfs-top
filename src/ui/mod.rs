@@ -22,6 +22,13 @@ pub const ACCENT_B: Color = Color::Rgb(89, 224, 166);
 pub const WARN: Color = Color::Rgb(255, 179, 71);
 
 pub fn draw(f: &mut Frame<'_>, app: &App) {
+    // Baseline bg fill. Without this, any cell that no widget below paints
+    // (border gaps inside the Tabs block, trailing cells in the status row,
+    // rounding leftovers from %-based layouts) keeps the terminal's default
+    // bg instead of our scheme — and on tab switches that asymmetry reads as
+    // a dirty redraw.
+    f.render_widget(Block::default().style(Style::default().bg(BG)), f.area());
+
     let areas = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(3), Constraint::Min(10), Constraint::Length(1)])
@@ -29,7 +36,12 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
 
     let tab_titles = Tab::titles().iter().copied().collect::<Vec<&str>>();
     let tabs = Tabs::new(tab_titles)
-        .block(Block::default().borders(Borders::ALL).title(" nfs-top "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" nfs-top ")
+                .style(Style::default().bg(PANEL)),
+        )
         .select(app.tab.idx())
         .highlight_style(Style::default().fg(ACCENT_A).add_modifier(Modifier::BOLD))
         .style(Style::default().fg(Color::Gray).bg(PANEL));
@@ -69,7 +81,13 @@ pub fn draw(f: &mut Frame<'_>, app: &App) {
         }
         (s, Style::default().fg(Color::Black).bg(WARN))
     };
-    let p = Paragraph::new(status).style(status_style);
+    // Wrap in a Block carrying the same style so every cell in the status
+    // row is filled — without this, cells past the end of the status text
+    // keep terminal-default bg instead of WARN/Red, leaving a torn-looking
+    // half-painted strip whenever the text length changes.
+    let p = Paragraph::new(status)
+        .style(status_style)
+        .block(Block::default().style(status_style));
     f.render_widget(p, areas[2]);
 }
 
