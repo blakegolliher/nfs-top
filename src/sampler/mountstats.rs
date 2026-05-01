@@ -129,6 +129,7 @@ fn parse_block(raw: &str) -> Option<MountCounters> {
         nconnect,
         addr,
         clientaddr,
+        st_dev: None,
         options,
         ops,
         raw_block: raw.to_string(),

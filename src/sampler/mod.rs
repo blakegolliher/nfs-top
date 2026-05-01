@@ -57,12 +57,38 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
             };
             let mut partial_errors: Vec<String> = Vec::new();
             let mount_opts = fallback("mounts", &mut partial_errors, mounts::read_mount_options());
+            let mount_devs = fallback("mountinfo", &mut partial_errors, mounts::read_mount_devs());
             let rpc = fallback("rpc", &mut partial_errors, rpc::read_rpc_client());
             let sockets = fallback(
                 "sockets",
                 &mut partial_errors,
                 sockets::read_observed_nfs(&cfg.remote_ports),
             );
+
+            // Pull the per-dev BPF snapshot before the mount loop so each
+            // MountView can carry its own latency split. The host-wide view
+            // is gone — the Hist tab follows the selected mount instead.
+            #[cfg(feature = "ebpf")]
+            let per_dev_bpf: HashMap<u32, crate::model::types::BpfLatency> = match enricher.as_mut() {
+                Some(e) => match e.snapshot() {
+                    Ok(b) => b,
+                    Err(err) => {
+                        partial_errors.push(format!("ebpf: {err:#}"));
+                        HashMap::new()
+                    }
+                },
+                None => HashMap::new(),
+            };
+            #[cfg(feature = "ebpf")]
+            let bpf_attached = enricher.is_some();
+            #[cfg(feature = "ebpf")]
+            if let Some(msg) = pending_ebpf_error.take() {
+                partial_errors.push(msg);
+            }
+            #[cfg(not(feature = "ebpf"))]
+            let per_dev_bpf: HashMap<u32, crate::model::types::BpfLatency> = HashMap::new();
+            #[cfg(not(feature = "ebpf"))]
+            let bpf_attached = false;
 
             let dt_secs = prev
                 .as_ref()
@@ -85,6 +111,7 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
                         m.nconnect = extra.get("nconnect").and_then(|v| v.parse::<u32>().ok());
                     }
                 }
+                m.st_dev = mount_devs.get(&m.mountpoint).copied();
 
                 let host = host_from_device(&m.device).unwrap_or_default();
                 let resolved = if cfg.no_dns { Vec::new() } else { dns_cache.resolve(host) };
@@ -107,7 +134,8 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
                     }
                 }
 
-                let derived = derive_rates(&m, prev_map.get(m.mountpoint.as_str()).copied(), dt_secs, observed_total, observed_by_ip);
+                let mut derived = derive_rates(&m, prev_map.get(m.mountpoint.as_str()).copied(), dt_secs, observed_total, observed_by_ip);
+                derived.bpf = m.st_dev.and_then(|d| per_dev_bpf.get(&d).cloned());
                 views.push(MountView {
                     counters: m,
                     derived,
@@ -117,28 +145,6 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
 
             let prev_counters = views.iter().map(|v| v.counters.clone()).collect::<Vec<_>>();
 
-            #[cfg(feature = "ebpf")]
-            let bpf = match enricher.as_mut() {
-                Some(e) => match e.snapshot() {
-                    Ok(b) => b,
-                    Err(err) => {
-                        partial_errors.push(format!("ebpf: {err:#}"));
-                        None
-                    }
-                },
-                None => None,
-            };
-            #[cfg(feature = "ebpf")]
-            let bpf_attached = enricher.is_some();
-            #[cfg(feature = "ebpf")]
-            if let Some(msg) = pending_ebpf_error.take() {
-                partial_errors.push(msg);
-            }
-            #[cfg(not(feature = "ebpf"))]
-            let bpf: Option<crate::model::types::BpfLatency> = None;
-            #[cfg(not(feature = "ebpf"))]
-            let bpf_attached = false;
-
             let snap = Snapshot {
                 ts: now,
                 dt_secs,
@@ -146,7 +152,6 @@ pub fn spawn_sampler(cfg: SamplerConfig) -> Receiver<Result<Snapshot>> {
                 rpc,
                 raw_tcp_matches: sockets.raw_matches,
                 partial_errors,
-                bpf,
                 bpf_attached,
             };
 
@@ -273,7 +278,7 @@ mod tests {
         );
         let prev = MountCounters {
             device: "s:/e".to_string(), mountpoint: "/m".to_string(), fstype: "nfs4".to_string(),
-            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, options: HashMap::new(), ops: prev_ops, raw_block: String::new(),
+            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, st_dev: None, options: HashMap::new(), ops: prev_ops, raw_block: String::new(),
         };
 
         let mut curr_ops = HashMap::new();
@@ -283,7 +288,7 @@ mod tests {
         );
         let curr = MountCounters {
             device: "s:/e".to_string(), mountpoint: "/m".to_string(), fstype: "nfs4".to_string(),
-            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, options: HashMap::new(), ops: curr_ops, raw_block: String::new(),
+            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, st_dev: None, options: HashMap::new(), ops: curr_ops, raw_block: String::new(),
         };
 
         let d = derive_rates(&curr, Some(&prev), 2.0, 0, vec![]);
@@ -303,7 +308,7 @@ mod tests {
         );
         let prev = MountCounters {
             device: "s:/e".to_string(), mountpoint: "/m".to_string(), fstype: "nfs4".to_string(),
-            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, options: HashMap::new(), ops: prev_ops, raw_block: String::new(),
+            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, st_dev: None, options: HashMap::new(), ops: prev_ops, raw_block: String::new(),
         };
 
         let mut curr_ops = HashMap::new();
@@ -313,7 +318,7 @@ mod tests {
         );
         let curr = MountCounters {
             device: "s:/e".to_string(), mountpoint: "/m".to_string(), fstype: "nfs4".to_string(),
-            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, options: HashMap::new(), ops: curr_ops, raw_block: String::new(),
+            vers: None, proto: None, nconnect: None, addr: None, clientaddr: None, st_dev: None, options: HashMap::new(), ops: curr_ops, raw_block: String::new(),
         };
 
         let d = derive_rates(&curr, Some(&prev), 1.0, 0, vec![]);

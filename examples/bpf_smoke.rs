@@ -56,29 +56,33 @@ fn main() -> Result<()> {
     let start = Instant::now();
     for tick in 0..6 {
         thread::sleep(Duration::from_secs(1));
-        match enricher.snapshot()? {
-            Some(b) => {
-                total_seen += b.total_samples;
+        let per_dev = enricher.snapshot()?;
+        let tick_total: u64 = per_dev.values().map(|b| b.total_samples).sum();
+        total_seen += tick_total;
+        if per_dev.is_empty() {
+            println!("tick {tick}: no new samples this interval");
+            continue;
+        }
+        println!(
+            "tick {tick} (+{:.1}s): {} new samples across {} dev(s)",
+            start.elapsed().as_secs_f64(),
+            tick_total,
+            per_dev.len()
+        );
+        for (dev, b) in &per_dev {
+            println!("  dev=0x{dev:x} ({} op(s), {} samples)", b.per_op.len(), b.total_samples);
+            for op in &b.per_op {
+                let d = &op.dist;
                 println!(
-                    "tick {tick} (+{:.1}s): {} new samples across {} op(s)",
-                    start.elapsed().as_secs_f64(),
-                    b.total_samples,
-                    b.per_op.len()
+                    "    {:7} samples={:6}  p50={}  p99={}  p99.9={}  max={}",
+                    op.op,
+                    d.samples,
+                    fmt_ns(d.p50_ns),
+                    fmt_ns(d.p99_ns),
+                    fmt_ns(d.p999_ns),
+                    fmt_ns(d.max_ns)
                 );
-                for op in &b.per_op {
-                    let d = &op.dist;
-                    println!(
-                        "    {:7} samples={:6}  p50={}  p99={}  p99.9={}  max={}",
-                        op.op,
-                        d.samples,
-                        fmt_ns(d.p50_ns),
-                        fmt_ns(d.p99_ns),
-                        fmt_ns(d.p999_ns),
-                        fmt_ns(d.max_ns)
-                    );
-                }
             }
-            None => println!("tick {tick}: no new samples this interval"),
         }
     }
 

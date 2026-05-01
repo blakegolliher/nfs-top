@@ -41,6 +41,12 @@ pub struct MountCounters {
     pub nconnect: Option<u32>,
     pub addr: Option<IpAddr>,
     pub clientaddr: Option<IpAddr>,
+    /// Kernel `super_block.s_dev` for this mount, packed as `MKDEV(major,
+    /// minor) = (major << 20) | minor` to match what BPF reads from the
+    /// inode chain. `None` means /proc/self/mountinfo wasn't readable or
+    /// didn't list this mountpoint. Used to cross-reference per-dev BPF
+    /// histogram buckets back to a mount.
+    pub st_dev: Option<u32>,
     pub options: HashMap<String, String>,
     pub ops: HashMap<String, OpCounters>,
     pub raw_block: String,
@@ -149,14 +155,10 @@ pub struct Snapshot {
     pub rpc: RpcClientCounters,
     pub raw_tcp_matches: Vec<String>,
     pub partial_errors: Vec<String>,
-    /// Optional eBPF-derived latency for this interval, aggregated across
-    /// all NFS mounts. `None` means the backend is disabled, did not
-    /// load, or saw no traffic this tick — `bpf_attached` disambiguates.
-    /// Per-mount split requires s_dev tagging and lands in a follow-up.
-    pub bpf: Option<BpfLatency>,
     /// True when the eBPF probes are loaded and attached. Lets the UI
-    /// distinguish "backend down" from "backend up but no traffic this
-    /// tick" — both flow through `bpf == None`.
+    /// distinguish "backend down" from "backend up but no samples for the
+    /// selected mount this tick" — per-mount data lives on
+    /// `MountDerived.bpf`.
     pub bpf_attached: bool,
 }
 

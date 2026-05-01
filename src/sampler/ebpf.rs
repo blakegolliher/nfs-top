@@ -55,10 +55,10 @@ pub fn op_name(id: u16) -> &'static str {
 pub struct Enricher {
     skel: NfsLatSkel<'static>,
     _open_object: Box<MaybeUninit<OpenObject>>,
-    /// Last-seen absolute count for every (op_id, bucket) we've ever
+    /// Last-seen absolute count for every (dev, op_id, bucket) we've ever
     /// observed in the kernel `hist` map. Used to compute per-tick deltas
     /// without resetting the map (snapshot-and-diff).
-    prev: HashMap<(u16, u16), u64>,
+    prev: HashMap<(u32, u16, u16), u64>,
 }
 
 impl Enricher {
@@ -86,53 +86,78 @@ impl Enricher {
     }
 
     /// Walk the kernel `hist` map, diff against the previous snapshot, and
-    /// fold the per-tick deltas into a `BpfLatency`. Returns `None` if no
-    /// op saw any new samples this tick.
-    pub fn snapshot(&mut self) -> Result<Option<BpfLatency>> {
+    /// fold the per-tick deltas into one `BpfLatency` per super_block dev.
+    /// Devices with no new samples this tick are absent from the map; a
+    /// dev_id of 0 collects samples whose init probe couldn't resolve the
+    /// inode chain.
+    pub fn snapshot(&mut self) -> Result<HashMap<u32, BpfLatency>> {
         let map = &self.skel.maps.hist;
-        let mut per_op: HashMap<u16, [u64; BUCKETS]> = HashMap::new();
-        let mut total_samples: u64 = 0;
-
+        let mut items: Vec<(u32, u16, u16, u64)> = Vec::new();
         for key_bytes in MapCore::keys(map) {
             let Some(val) = MapCore::lookup(map, &key_bytes, MapFlags::ANY)? else {
                 continue;
             };
-            if key_bytes.len() < 4 || val.len() < 8 {
+            if key_bytes.len() < 8 || val.len() < 8 {
                 continue;
             }
-            let op_id = u16::from_ne_bytes([key_bytes[0], key_bytes[1]]);
-            let bucket = u16::from_ne_bytes([key_bytes[2], key_bytes[3]]);
+            // Layout: [dev:4][op_id:2][bucket:2] (matches `struct hist_key`).
+            let dev = u32::from_ne_bytes(key_bytes[0..4].try_into().unwrap());
+            let op_id = u16::from_ne_bytes([key_bytes[4], key_bytes[5]]);
+            let bucket = u16::from_ne_bytes([key_bytes[6], key_bytes[7]]);
             let curr = u64::from_ne_bytes(val[..8].try_into().unwrap());
-            let entry = self.prev.entry((op_id, bucket)).or_insert(0);
-            let delta = curr.saturating_sub(*entry);
-            *entry = curr;
-            if delta == 0 {
-                continue;
-            }
-            let bucket = (bucket as usize).min(BUCKETS - 1);
-            per_op.entry(op_id).or_insert_with(|| [0u64; BUCKETS])[bucket] += delta;
-            total_samples = total_samples.saturating_add(delta);
+            items.push((dev, op_id, bucket, curr));
         }
-
-        if per_op.is_empty() {
-            return Ok(None);
-        }
-
-        let mut out: Vec<BpfOpLatency> = per_op
-            .into_iter()
-            .map(|(op_id, buckets)| BpfOpLatency {
-                op: op_name(op_id).to_string(),
-                dist: dist_from_buckets(&buckets),
-                buckets: buckets.to_vec(),
-            })
-            .collect();
-        out.sort_by(|a, b| b.dist.samples.cmp(&a.dist.samples));
-
-        Ok(Some(BpfLatency {
-            per_op: out,
-            total_samples,
-        }))
+        Ok(fold_deltas(&mut self.prev, items))
     }
+}
+
+/// Apply per-(dev, op, bucket) deltas against `prev` and produce one
+/// `BpfLatency` per dev that saw new samples this tick. Pure function so
+/// the per-dev folding logic is unit-testable without a live BPF map.
+fn fold_deltas(
+    prev: &mut HashMap<(u32, u16, u16), u64>,
+    items: impl IntoIterator<Item = (u32, u16, u16, u64)>,
+) -> HashMap<u32, BpfLatency> {
+    let mut per_dev: HashMap<u32, HashMap<u16, [u64; BUCKETS]>> = HashMap::new();
+    let mut totals: HashMap<u32, u64> = HashMap::new();
+
+    for (dev, op_id, bucket, curr) in items {
+        let entry = prev.entry((dev, op_id, bucket)).or_insert(0);
+        let delta = curr.saturating_sub(*entry);
+        *entry = curr;
+        if delta == 0 {
+            continue;
+        }
+        let bucket_idx = (bucket as usize).min(BUCKETS - 1);
+        per_dev
+            .entry(dev)
+            .or_default()
+            .entry(op_id)
+            .or_insert_with(|| [0u64; BUCKETS])[bucket_idx] += delta;
+        let t = totals.entry(dev).or_insert(0);
+        *t = t.saturating_add(delta);
+    }
+
+    per_dev
+        .into_iter()
+        .map(|(dev, ops)| {
+            let total = totals.get(&dev).copied().unwrap_or(0);
+            (dev, build_bpf_latency(ops, total))
+        })
+        .collect()
+}
+
+fn build_bpf_latency(ops: HashMap<u16, [u64; BUCKETS]>, total_samples: u64) -> BpfLatency {
+    let mut per_op: Vec<BpfOpLatency> = ops
+        .into_iter()
+        .map(|(op_id, buckets)| BpfOpLatency {
+            op: op_name(op_id).to_string(),
+            dist: dist_from_buckets(&buckets),
+            buckets: buckets.to_vec(),
+        })
+        .collect();
+    per_op.sort_by(|a, b| b.dist.samples.cmp(&a.dist.samples));
+    BpfLatency { per_op, total_samples }
 }
 
 fn dist_from_buckets(buckets: &[u64; BUCKETS]) -> LatencyDist {
@@ -146,5 +171,59 @@ fn dist_from_buckets(buckets: &[u64; BUCKETS]) -> LatencyDist {
         p9999_ns: hist::percentile_ns(buckets, samples, 0.9999),
         p99999_ns: hist::percentile_ns(buckets, samples, 0.99999),
         max_ns: hist::max_ns(buckets),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fold_deltas_splits_by_dev_and_op() {
+        let mut prev: HashMap<(u32, u16, u16), u64> = HashMap::new();
+        // Two devs (51, 82). Two ops on dev 51, one on dev 82.
+        let items = vec![
+            (51u32, OP_READ, 10u16, 5u64),
+            (51, OP_READ, 12, 1),
+            (51, OP_WRITE, 14, 2),
+            (82, OP_READ, 10, 3),
+        ];
+        let out = fold_deltas(&mut prev, items);
+        assert_eq!(out.len(), 2);
+        let dev51 = out.get(&51).expect("dev 51");
+        let dev82 = out.get(&82).expect("dev 82");
+        assert_eq!(dev51.total_samples, 5 + 1 + 2);
+        assert_eq!(dev82.total_samples, 3);
+        // Per-op rows are sorted by sample count desc.
+        assert_eq!(dev51.per_op[0].op, "READ");
+        assert_eq!(dev51.per_op[0].dist.samples, 6);
+        assert_eq!(dev51.per_op[1].op, "WRITE");
+        assert_eq!(dev51.per_op[1].dist.samples, 2);
+    }
+
+    #[test]
+    fn fold_deltas_subtracts_against_prev() {
+        let mut prev: HashMap<(u32, u16, u16), u64> = HashMap::new();
+        // First tick: 10 samples seen at (dev=51, READ, b=10).
+        let _ = fold_deltas(&mut prev, vec![(51, OP_READ, 10, 10)]);
+        // Second tick: kernel counter advanced to 13 → expect delta=3.
+        let out = fold_deltas(&mut prev, vec![(51, OP_READ, 10, 13)]);
+        assert_eq!(out.get(&51).unwrap().total_samples, 3);
+        // Third tick: no advance → no entry produced.
+        let out = fold_deltas(&mut prev, vec![(51, OP_READ, 10, 13)]);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn fold_deltas_zero_dev_is_collected_separately() {
+        // dev=0 (unattributed) must not get pooled into a real mount's bucket.
+        let mut prev: HashMap<(u32, u16, u16), u64> = HashMap::new();
+        let out = fold_deltas(
+            &mut prev,
+            vec![(0, OP_READ, 10, 1), (51, OP_READ, 10, 2)],
+        );
+        assert_eq!(out.len(), 2);
+        assert_eq!(out.get(&0).unwrap().total_samples, 1);
+        assert_eq!(out.get(&51).unwrap().total_samples, 2);
     }
 }

@@ -13,21 +13,49 @@
  *
  * In-flight key: pointer to nfs_pgio_header (read/write) or
  * nfs_commit_data (commit), which is stable across the init/done pair.
- * No struct-field dereferences in v0, so no module BTF dependency.
  *
- * Histogram key: (op_id, log2(latency_ns)). Userspace deltas the
+ * Each init probe walks `(hdr|cdata) -> inode -> i_sb -> s_dev` via CO-RE
+ * to tag the in-flight entry with the originating mount's super_block
+ * device id. The done probe copies that id into the histogram key, so
+ * userspace can split the per-tick deltas per mount without paying for
+ * the struct walk on the hot path.
+ *
+ * Histogram key: (dev, op_id, log2(latency_ns)). Userspace deltas the
  * counts each tick (snapshot-and-diff), no map reset.
  */
 #include <linux/bpf.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_core_read.h>
 
 #include "nfs_lat.bpf.h"
 
 char LICENSE[] SEC("license") = "GPL";
 
+/*
+ * Minimal CO-RE struct stubs. libbpf relocates the field offsets against
+ * the running kernel's BTF at load time — we never assume a layout.
+ * Listing only the fields we read keeps this header free of vmlinux.h
+ * bloat and the bpftool runtime dep that would come with generating it.
+ */
+struct super_block {
+	__u32 s_dev;
+} __attribute__((preserve_access_index));
+
+struct inode {
+	struct super_block *i_sb;
+} __attribute__((preserve_access_index));
+
+struct nfs_pgio_header {
+	struct inode *inode;
+} __attribute__((preserve_access_index));
+
+struct nfs_commit_data {
+	struct inode *inode;
+} __attribute__((preserve_access_index));
+
 struct {
 	__uint(type, BPF_MAP_TYPE_HASH);
-	__uint(max_entries, 1024);
+	__uint(max_entries, 8192);
 	__type(key, struct hist_key);
 	__type(value, __u64);
 } hist SEC(".maps");
@@ -47,11 +75,30 @@ static __always_inline __u16 log2_bucket(__u64 ns)
 	return 63 - __builtin_clzll(ns);
 }
 
-static __always_inline int record_start(__u64 key, __u16 op_id)
+static __always_inline __u32 dev_from_pgio(void *hdr_ptr)
+{
+	struct nfs_pgio_header *hdr = hdr_ptr;
+	struct inode *ino = BPF_CORE_READ(hdr, inode);
+	if (!ino)
+		return 0;
+	return BPF_CORE_READ(ino, i_sb, s_dev);
+}
+
+static __always_inline __u32 dev_from_commit(void *cdata_ptr)
+{
+	struct nfs_commit_data *c = cdata_ptr;
+	struct inode *ino = BPF_CORE_READ(c, inode);
+	if (!ino)
+		return 0;
+	return BPF_CORE_READ(ino, i_sb, s_dev);
+}
+
+static __always_inline int record_start(__u64 key, __u16 op_id, __u32 dev)
 {
 	struct inflight_val v = {};
 	v.ts_ns = bpf_ktime_get_ns();
 	v.op_id = op_id;
+	v.dev = dev;
 	bpf_map_update_elem(&inflight, &key, &v, BPF_ANY);
 	return 0;
 }
@@ -64,11 +111,12 @@ static __always_inline int record_done(__u64 key)
 
 	__u64 lat = bpf_ktime_get_ns() - v->ts_ns;
 	struct hist_key hk = {
+		.dev = v->dev,
 		.op_id = v->op_id,
 		.bucket = log2_bucket(lat),
 	};
 	/* Race-safe cold-start: two CPUs landing on a never-seen
-	 * (op_id, bucket) both BPF_NOEXIST(zero); whichever loses still
+	 * (dev, op_id, bucket) both BPF_NOEXIST(zero); whichever loses still
 	 * sees the entry on the second lookup, so neither sample is lost. */
 	__u64 *cnt = bpf_map_lookup_elem(&hist, &hk);
 	if (!cnt) {
@@ -89,7 +137,8 @@ static __always_inline int record_done(__u64 key)
 SEC("raw_tracepoint/nfs_initiate_read")
 int handle_read_init(struct bpf_raw_tracepoint_args *ctx)
 {
-	return record_start(ctx->args[0], OP_READ);
+	void *hdr = (void *)ctx->args[0];
+	return record_start((__u64)hdr, OP_READ, dev_from_pgio(hdr));
 }
 
 SEC("raw_tracepoint/nfs_readpage_done")
@@ -102,7 +151,8 @@ int handle_read_done(struct bpf_raw_tracepoint_args *ctx)
 SEC("raw_tracepoint/nfs_initiate_write")
 int handle_write_init(struct bpf_raw_tracepoint_args *ctx)
 {
-	return record_start(ctx->args[0], OP_WRITE);
+	void *hdr = (void *)ctx->args[0];
+	return record_start((__u64)hdr, OP_WRITE, dev_from_pgio(hdr));
 }
 
 SEC("raw_tracepoint/nfs_writeback_done")
@@ -115,7 +165,8 @@ int handle_write_done(struct bpf_raw_tracepoint_args *ctx)
 SEC("raw_tracepoint/nfs_initiate_commit")
 int handle_commit_init(struct bpf_raw_tracepoint_args *ctx)
 {
-	return record_start(ctx->args[0], OP_COMMIT);
+	void *cdata = (void *)ctx->args[0];
+	return record_start((__u64)cdata, OP_COMMIT, dev_from_commit(cdata));
 }
 
 SEC("raw_tracepoint/nfs_commit_done")

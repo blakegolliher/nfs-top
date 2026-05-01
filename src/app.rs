@@ -7,7 +7,7 @@ use std::time::SystemTime;
 use std::net::IpAddr;
 
 use crate::model::derive::host_from_device;
-use crate::model::types::{MountView, OpDerived, ServerAgg, Snapshot, SortKey, UnitsMode};
+use crate::model::types::{BpfLatency, BpfOpLatency, MountView, OpDerived, ServerAgg, Snapshot, SortKey, UnitsMode};
 use crate::util::ringbuf::RingBuf;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -140,6 +140,19 @@ pub struct App {
     pub tab: Tab,
     pub selected: usize,
     pub server_selected: usize,
+    /// Stable identity of the selected mount (its mountpoint). When the
+    /// per-tick re-sort changes row order, we relocate `selected` by this key
+    /// so the highlight tracks the same mount instead of whatever happens to
+    /// land at that row index.
+    selected_mount_key: Option<String>,
+    /// Stable identity of the selected server (its address). Same role as
+    /// `selected_mount_key` for the Servers tab.
+    selected_server_key: Option<Option<IpAddr>>,
+    /// Stable identity of the highlighted op on the Hist tab. Per-tick the
+    /// BPF aggregator re-sorts ops by sample count, so a positional index
+    /// would visibly drift; we anchor by op name and recompute the row each
+    /// render.
+    selected_op_key: Option<String>,
     pub paused: bool,
     pub filter: String,
     filter_lower: String,
@@ -174,6 +187,9 @@ impl App {
             tab: Tab::Overview,
             selected: 0,
             server_selected: 0,
+            selected_mount_key: None,
+            selected_server_key: None,
+            selected_op_key: None,
             paused: false,
             filter,
             filter_lower,
@@ -220,7 +236,7 @@ impl App {
         self.cached_visible_idx = self.compute_visible_indices(&snap.mounts);
         self.last_sample = Some(snap.ts);
         self.snapshot = Some(snap);
-        self.clamp_selection();
+        self.resync_selections();
     }
 
     fn update_global_history(&mut self, snap: &Snapshot) {
@@ -285,9 +301,96 @@ impl App {
         idx
     }
 
-    fn clamp_selection(&mut self) {
-        self.selected = self.selected.min(self.cached_visible_idx.len().saturating_sub(1));
-        self.server_selected = self.server_selected.min(self.cached_servers.len().saturating_sub(1));
+    /// Re-anchor `selected` / `server_selected` to the mount/server they were
+    /// pointing at before the latest re-sort. If the previously-selected item
+    /// is gone (or no key is set yet), clamp the index into range and prime
+    /// the key from whatever now sits at that row.
+    fn resync_selections(&mut self) {
+        let mount_key = self.selected_mount_key.clone();
+        let new_mount_idx = mount_key
+            .as_deref()
+            .and_then(|k| self.position_of_mount(k));
+        match new_mount_idx {
+            Some(pos) => self.selected = pos,
+            None => {
+                self.selected = self.selected.min(self.cached_visible_idx.len().saturating_sub(1));
+                self.selected_mount_key = self.current_mount_key();
+            }
+        }
+
+        let server_key = self.selected_server_key;
+        let new_server_idx = server_key.and_then(|k| self.cached_servers.iter().position(|s| s.addr == k));
+        match new_server_idx {
+            Some(pos) => self.server_selected = pos,
+            None => {
+                self.server_selected = self.server_selected.min(self.cached_servers.len().saturating_sub(1));
+                self.selected_server_key = self.cached_servers.get(self.server_selected).map(|s| s.addr);
+            }
+        }
+    }
+
+    fn position_of_mount(&self, mountpoint: &str) -> Option<usize> {
+        let snap = self.snapshot.as_ref()?;
+        self.cached_visible_idx
+            .iter()
+            .position(|&i| snap.mounts.get(i).map(|m| m.counters.mountpoint.as_str()) == Some(mountpoint))
+    }
+
+    fn current_mount_key(&self) -> Option<String> {
+        self.selected_mount().map(|m| m.counters.mountpoint.clone())
+    }
+
+    /// Move the mounts-pane highlight by `delta` rows and pin the new row's
+    /// mountpoint as the selection anchor. Negative deltas move up.
+    pub fn move_mount_selection(&mut self, delta: i32) {
+        self.selected = step_index(self.selected, delta, self.cached_visible_idx.len());
+        self.selected_mount_key = self.current_mount_key();
+    }
+
+    /// Move the servers-pane highlight by `delta` rows and pin the new row's
+    /// address as the selection anchor. Negative deltas move up.
+    pub fn move_server_selection(&mut self, delta: i32) {
+        self.server_selected = step_index(self.server_selected, delta, self.cached_servers.len());
+        self.selected_server_key = self.selected_server().map(|s| s.addr);
+    }
+
+    /// Move the Hist tab's selected op by `delta` rows. No-op when the
+    /// selected mount has no BPF data this tick. Negative deltas move up.
+    pub fn move_hist_selection(&mut self, delta: i32) {
+        let Some(bpf) = self.selected_mount_bpf() else { return };
+        if bpf.per_op.is_empty() {
+            return;
+        }
+        let cur = self
+            .selected_op_key
+            .as_deref()
+            .and_then(|k| bpf.per_op.iter().position(|o| o.op == k))
+            .unwrap_or(0);
+        let new = step_index(cur, delta, bpf.per_op.len());
+        self.selected_op_key = Some(bpf.per_op[new].op.clone());
+    }
+
+    /// BPF latency for the currently selected mount, or `None` when no
+    /// mount is selected or the mount saw no samples this tick.
+    pub fn selected_mount_bpf(&self) -> Option<&BpfLatency> {
+        self.selected_mount()?.derived.bpf.as_ref()
+    }
+
+    /// Resolve the selection anchor against the selected mount's BPF
+    /// snapshot. Returns the row index and op for the Hist-tab highlight
+    /// and sparkline. Falls back to row 0 when no anchor is set yet or
+    /// when the previously-selected op stopped reporting samples.
+    pub fn selected_bpf_op(&self) -> Option<(usize, &BpfOpLatency)> {
+        let bpf = self.selected_mount_bpf()?;
+        if bpf.per_op.is_empty() {
+            return None;
+        }
+        let idx = self
+            .selected_op_key
+            .as_deref()
+            .and_then(|k| bpf.per_op.iter().position(|o| o.op == k))
+            .unwrap_or(0);
+        Some((idx, &bpf.per_op[idx]))
     }
 
     /// Cycle the sort key. Re-sorts the cached visible mounts and server
@@ -302,6 +405,7 @@ impl App {
                 .sort_by(|&a, &b| compare_mounts_by(&mounts[a], &mounts[b], sort));
         }
         sort_servers(&mut self.cached_servers, sort);
+        self.resync_selections();
     }
 
     pub fn visible_mounts(&self) -> Vec<&MountView> {
@@ -374,6 +478,14 @@ impl App {
         let q = &self.filter_lower;
         m.counters.mountpoint.to_lowercase().contains(q) || m.counters.device.to_lowercase().contains(q)
     }
+}
+
+fn step_index(idx: usize, delta: i32, len: usize) -> usize {
+    if len == 0 {
+        return 0;
+    }
+    let max = (len - 1) as i64;
+    (idx as i64 + delta as i64).clamp(0, max) as usize
 }
 
 fn compare_mounts_by(a: &MountView, b: &MountView, sort: SortKey) -> Ordering {

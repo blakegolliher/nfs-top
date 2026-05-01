@@ -68,20 +68,16 @@ fn run_loop(
                     KeyCode::Char('q') => return Ok(()),
                     KeyCode::Left | KeyCode::Char('h') => app.tab = app.tab.prev(),
                     KeyCode::Right | KeyCode::Char('l') => app.tab = app.tab.next(),
-                    KeyCode::Down | KeyCode::Char('j') => {
-                        if app.tab == Tab::Servers {
-                            app.server_selected = app.server_selected.saturating_add(1);
-                        } else {
-                            app.selected = app.selected.saturating_add(1);
-                        }
-                    }
-                    KeyCode::Up | KeyCode::Char('k') => {
-                        if app.tab == Tab::Servers {
-                            app.server_selected = app.server_selected.saturating_sub(1);
-                        } else {
-                            app.selected = app.selected.saturating_sub(1);
-                        }
-                    }
+                    KeyCode::Down | KeyCode::Char('j') => match app.tab {
+                        Tab::Servers => app.move_server_selection(1),
+                        Tab::Hist => app.move_hist_selection(1),
+                        _ => app.move_mount_selection(1),
+                    },
+                    KeyCode::Up | KeyCode::Char('k') => match app.tab {
+                        Tab::Servers => app.move_server_selection(-1),
+                        Tab::Hist => app.move_hist_selection(-1),
+                        _ => app.move_mount_selection(-1),
+                    },
                     KeyCode::Char('?') => app.tab = Tab::Help,
                     KeyCode::Char(' ') => app.paused = !app.paused,
                     KeyCode::Char('r') => app.reset_baseline(),

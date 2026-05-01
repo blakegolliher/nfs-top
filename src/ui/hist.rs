@@ -1,9 +1,11 @@
 //! eBPF latency histogram tab.
 //!
-//! Renders per-op p50..p99.999 + a log-scale bucket sparkline, populated
-//! from `Snapshot.bpf`. Visible whenever the binary is built with the
-//! `ebpf` feature; on builds or hosts without working probes the tab
-//! shows a single explanatory line — no panic, no empty chrome.
+//! Renders per-op p50..p99.999 + a log-scale bucket sparkline for the
+//! mount currently selected on the Overview pane. Populated from
+//! `MountDerived.bpf`. Visible whenever the binary is built with the
+//! `ebpf` feature; on builds or hosts without working probes — or when
+//! the selected mount has seen no samples this tick — the tab shows a
+//! single explanatory line.
 
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -16,11 +18,18 @@ use crate::model::types::{BpfLatency, BpfOpLatency};
 use crate::ui::{panel, ACCENT_A};
 
 pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
-    let block = panel("Latency histogram (eBPF)");
+    let title = match app.selected_mount() {
+        Some(m) => format!(
+            "Latency histogram (eBPF) — {} — j/k to select op",
+            m.counters.mountpoint
+        ),
+        None => "Latency histogram (eBPF) — j/k to select op".to_string(),
+    };
+    let block = panel(&title);
     let inner = block.inner(area);
     f.render_widget(block, area);
 
-    let bpf = match app.snapshot.as_ref().and_then(|s| s.bpf.as_ref()) {
+    let bpf = match app.selected_mount_bpf() {
         Some(b) if !b.per_op.is_empty() => b,
         _ => {
             let msg = empty_message(app);
@@ -29,7 +38,9 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         }
     };
 
-    // 1 header + N data rows + sparkline (2 lines) + totals (1 line).
+    let selected_idx = app.selected_bpf_op().map(|(i, _)| i).unwrap_or(0);
+
+    // 1 header + N data rows + sparkline (>=3 lines) + totals (1 line).
     let table_h = (bpf.per_op.len() as u16) + 1;
     let parts = Layout::default()
         .direction(Direction::Vertical)
@@ -40,15 +51,15 @@ pub fn draw(f: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .split(inner);
 
-    f.render_widget(percentile_table(bpf), parts[0]);
+    f.render_widget(percentile_table(bpf, selected_idx), parts[0]);
     let totals = format!("{} samples this tick", fmt_count(bpf.total_samples));
     f.render_widget(
         Paragraph::new(totals).style(Style::default().fg(Color::DarkGray)),
         parts[1],
     );
 
-    if let Some(top) = bpf.per_op.first() {
-        f.render_widget(distribution_line(top), parts[2]);
+    if let Some(op) = bpf.per_op.get(selected_idx) {
+        f.render_widget(distribution_line(op), parts[2]);
     }
 }
 
@@ -58,23 +69,44 @@ fn empty_message(app: &App) -> Line<'static> {
         .as_ref()
         .map(|s| s.bpf_attached)
         .unwrap_or(false);
-    let msg = if !cfg!(feature = "ebpf") {
-        "Built without --features=ebpf. Rebuild with `cargo build --features=ebpf` to enable per-op latency histograms."
-    } else if attached {
-        "eBPF probes attached — waiting for NFS RPC traffic on this host."
+    let has_mount = app.selected_mount().is_some();
+    let msg: String = if !cfg!(feature = "ebpf") {
+        "Built without --features=ebpf. Rebuild with `cargo build --features=ebpf` to enable per-op latency histograms.".into()
+    } else if !attached {
+        "eBPF backend not active — needs CAP_BPF and a kernel with NFS BTF (RHEL 9+). Run with sudo or `setcap cap_bpf,cap_sys_resource=ep`. (Check the status bar for the load error.)".into()
+    } else if !has_mount {
+        "eBPF probes attached — no NFS mount selected on the Overview pane.".into()
     } else {
-        "eBPF backend not active — needs CAP_BPF and a kernel with NFS BTF (RHEL 9+). Run with sudo or `setcap cap_bpf,cap_sys_resource=ep`. (Check the status bar for the load error.)"
+        match app.selected_mount() {
+            Some(m) => format!(
+                "eBPF probes attached — no samples for {} this tick.",
+                m.counters.mountpoint
+            ),
+            None => "eBPF probes attached — waiting for NFS RPC traffic.".into(),
+        }
     };
     Line::from(vec![Span::styled(msg, Style::default().fg(Color::Gray))])
 }
 
-fn percentile_table(bpf: &BpfLatency) -> Table<'static> {
+fn percentile_table(bpf: &BpfLatency, selected_idx: usize) -> Table<'static> {
     let header_cells = ["op", "samples", "p50", "p90", "p99", "p99.9", "p99.99", "p99.999", "max"]
         .into_iter()
         .map(|h| Cell::from(h).style(Style::default().fg(ACCENT_A).add_modifier(Modifier::BOLD)));
     let header = Row::new(header_cells).height(1);
 
-    let rows: Vec<Row> = bpf.per_op.iter().map(row_for_op).collect();
+    let rows: Vec<Row> = bpf
+        .per_op
+        .iter()
+        .enumerate()
+        .map(|(i, op)| {
+            let row = row_for_op(op);
+            if i == selected_idx {
+                row.style(Style::default().fg(Color::Black).bg(ACCENT_A))
+            } else {
+                row
+            }
+        })
+        .collect();
 
     let widths = [
         Constraint::Length(8),
