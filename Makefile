@@ -2,25 +2,41 @@ SHELL := /usr/bin/env bash
 
 BIN ?= nfs-top
 PROFILE ?= release
-FEATURES ?= crossterm
+# `ebpf` is on by default so packaged builds carry the eBPF latency enricher.
+# Override with `make FEATURES=crossterm ...` (or any other set) to opt out.
+# Building with `ebpf` requires clang + libelf + zlib headers at build time and
+# Linux 5.14+ with BTF (and CAP_BPF or root) at runtime.
+FEATURES ?= crossterm ebpf
 OUTDIR ?= dist
 
-# Build targets for broad Linux portability.
-TARGETS ?= x86_64-unknown-linux-musl aarch64-unknown-linux-musl armv7-unknown-linux-musleabihf
+# Make sure cargo-installed binaries are findable even when `make` is invoked
+# from a shell that didn't source ~/.cargo/env.
+export PATH := $(HOME)/.cargo/bin:$(PATH)
+
+# Detect the host package manager once so the setup helpers below can install
+# missing build dependencies without a second probe per call.
+PKG_MGR := $(shell \
+    if   command -v apt-get >/dev/null 2>&1; then echo apt; \
+    elif command -v dnf     >/dev/null 2>&1; then echo dnf; \
+    elif command -v yum     >/dev/null 2>&1; then echo yum; \
+    elif command -v zypper  >/dev/null 2>&1; then echo zypper; \
+    elif command -v pacman  >/dev/null 2>&1; then echo pacman; \
+    else echo unknown; fi)
+
+# Drop `sudo` when already root or when sudo is unavailable. Lets the same
+# recipes work in containers (typically root, no sudo) and on workstations.
+SUDO := $(shell if [ "$$(id -u)" -eq 0 ] || ! command -v sudo >/dev/null 2>&1; then echo ""; else echo sudo; fi)
 
 HOST_TARGET := $(shell rustc -vV | sed -n 's/^host: //p')
-HOST_ARCH := $(firstword $(subst -, ,$(HOST_TARGET)))
 HOST_OS := $(word 3,$(subst -, ,$(HOST_TARGET)))
 
-ifeq ($(HOST_ARCH),x86_64)
-HOST_MUSL_TARGET := x86_64-unknown-linux-musl
-else ifeq ($(HOST_ARCH),aarch64)
-HOST_MUSL_TARGET := aarch64-unknown-linux-musl
-else ifeq ($(HOST_ARCH),armv7)
-HOST_MUSL_TARGET := armv7-unknown-linux-musleabihf
-else
-HOST_MUSL_TARGET := $(HOST_TARGET)
-endif
+# Default to a single host-native build. Cross-arch builds are still possible
+# by passing TARGET=<triple> (or overriding TARGETS), but the user must supply
+# a matching C toolchain plus libelf/zlib for that arch — `cross` (cargo-cross)
+# is the easiest path. We dropped the static-musl pipeline because libbpf-sys
+# bundles libbpf C sources that need libelf and zlib headers + libraries built
+# for the target libc, which musl distros don't ship.
+TARGETS ?= $(HOST_TARGET)
 
 ifeq ($(PROFILE),release)
 PROFILE_FLAG := --release
@@ -28,8 +44,8 @@ else
 PROFILE_FLAG :=
 endif
 
-COMMON_FLAGS := --no-default-features --features $(FEATURES)
-PORTABLE_RUSTFLAGS := -C target-cpu=generic -C strip=symbols -C debuginfo=0 -C panic=abort
+COMMON_FLAGS := --no-default-features --features "$(FEATURES)"
+PORTABLE_RUSTFLAGS := -C strip=symbols -C debuginfo=0 -C panic=abort
 
 define ensure_target
 	@if command -v rustup >/dev/null 2>&1; then \
@@ -44,11 +60,27 @@ define ensure_target
 	fi
 endef
 
+# Install $(1) via the host package manager if it is not already on PATH.
+# Args: (1) command to check, (2) dnf/yum/zypper pkg, (3) apt pkg, (4) pacman pkg.
+define ensure_tool
+	@if ! command -v $(1) >/dev/null 2>&1; then \
+		echo ">> installing $(1) via $(PKG_MGR)"; \
+		case "$(PKG_MGR)" in \
+			apt)            $(SUDO) apt-get update -qq && $(SUDO) apt-get install -y $(3) ;; \
+			dnf|yum|zypper) $(SUDO) $(PKG_MGR) install -y $(2) ;; \
+			pacman)         $(SUDO) pacman -S --noconfirm $(4) ;; \
+			*) echo "** unknown package manager; please install '$(1)' manually then re-run"; exit 2 ;; \
+		esac; \
+		command -v $(1) >/dev/null 2>&1 || { echo "** $(1) still missing after install attempt"; exit 2; }; \
+	fi
+endef
+
 .PHONY: help
 help:
-	@echo "make portable-host          Build static host-arch Linux binary (musl)"
-	@echo "make portable-all           Build static binaries for $(TARGETS)"
-	@echo "make portable TARGET=<triple> Build one static target (uses cargo-zigbuild if present)"
+	@echo "make setup                  Install build deps (clang, libelf-devel, zlib-devel, pkg-config)"
+	@echo "make portable-host          Build host-arch Linux binary"
+	@echo "make portable-all           Build binaries for $(TARGETS)"
+	@echo "make portable TARGET=<triple> Build one target (cross-arch needs a matching C toolchain)"
 	@echo "make deb                    Build a .deb for the host arch (set DEB_TARGET=<triple> to cross)"
 	@echo "make deb-all                Build .debs for all $(TARGETS)"
 	@echo "make rpm                    Build an .rpm for the host arch (set RPM_TARGET=<triple> to cross)"
@@ -63,26 +95,75 @@ help:
 	@echo "  PKG_MAINTAINER=$(PKG_MAINTAINER)"
 	@echo "  PKG_LICENSE=$(PKG_LICENSE)  RPM_RELEASE=$(RPM_RELEASE)"
 
+# ---- Build dependency setup -------------------------------------------------
+# `make setup` installs everything needed for the build/packaging targets:
+#   - clang     (libbpf-cargo invokes it to compile BPF objects when `ebpf` is
+#               in FEATURES; harmless to install when it is not)
+#   - libelf + zlib headers and pkg-config (libbpf-sys's bundled libbpf C
+#               sources #include <libelf.h> and <zlib.h>, and locate them via
+#               pkg-config)
+# Each step is idempotent — it checks first and skips if already present, so
+# wiring it as a prerequisite of the build targets is cheap on re-runs.
+.PHONY: setup
+setup: setup-rustup setup-clang setup-bpf-deps
+	@echo ">> build deps OK"
+
+.PHONY: setup-clang
+setup-clang:
+	$(call ensure_tool,clang,clang,clang,clang)
+
+.PHONY: setup-rustup
+setup-rustup:
+	@if ! command -v cargo >/dev/null 2>&1; then \
+		echo "** cargo not installed"; \
+		echo "   install rustup: curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y"; \
+		exit 2; \
+	fi
+
+# libbpf-sys requires libelf + zlib headers/libs at build time and pkg-config
+# to find them. Header presence is a more reliable check than `command -v`.
+.PHONY: setup-bpf-deps
+setup-bpf-deps:
+	$(call ensure_tool,pkg-config,pkgconf-pkg-config,pkg-config,pkgconf)
+	@if [[ ! -e /usr/include/libelf.h ]] && [[ ! -e /usr/include/elfutils/libelf.h ]]; then \
+		echo ">> installing libelf headers via $(PKG_MGR)"; \
+		case "$(PKG_MGR)" in \
+			apt)            $(SUDO) apt-get update -qq && $(SUDO) apt-get install -y libelf-dev ;; \
+			dnf|yum|zypper) $(SUDO) $(PKG_MGR) install -y elfutils-libelf-devel ;; \
+			pacman)         $(SUDO) pacman -S --noconfirm libelf ;; \
+			*) echo "** unknown package manager; install libelf headers manually"; exit 2 ;; \
+		esac; \
+	fi
+	@if [[ ! -e /usr/include/zlib.h ]]; then \
+		echo ">> installing zlib headers via $(PKG_MGR)"; \
+		case "$(PKG_MGR)" in \
+			apt)            $(SUDO) apt-get update -qq && $(SUDO) apt-get install -y zlib1g-dev ;; \
+			dnf|yum|zypper) $(SUDO) $(PKG_MGR) install -y zlib-devel ;; \
+			pacman)         $(SUDO) pacman -S --noconfirm zlib ;; \
+			*) echo "** unknown package manager; install zlib headers manually"; exit 2 ;; \
+		esac; \
+	fi
+
+.PHONY: setup-deb
+setup-deb: setup
+	$(call ensure_tool,ar,binutils,binutils,binutils)
+
+.PHONY: setup-rpm
+setup-rpm: setup
+	$(call ensure_tool,rpmbuild,rpm-build,rpm,rpm)
+
+# ---- Portable (musl) builds -------------------------------------------------
+
 .PHONY: portable-host
 portable-host:
 	@if [[ "$(HOST_OS)" != "linux" ]]; then echo "portable-host is Linux-only"; exit 2; fi
-	$(call ensure_target,$(HOST_MUSL_TARGET))
-	@RUSTFLAGS="$(PORTABLE_RUSTFLAGS)" cargo build $(PROFILE_FLAG) $(COMMON_FLAGS) --target $(HOST_MUSL_TARGET)
-	@mkdir -p $(OUTDIR)
-	@cp target/$(HOST_MUSL_TARGET)/$(PROFILE)/$(BIN) $(OUTDIR)/$(BIN)-$(HOST_MUSL_TARGET)
-	@echo "Built $(OUTDIR)/$(BIN)-$(HOST_MUSL_TARGET)"
-	@file $(OUTDIR)/$(BIN)-$(HOST_MUSL_TARGET) || true
+	@$(MAKE) portable TARGET=$(HOST_TARGET) PROFILE=$(PROFILE) FEATURES="$(FEATURES)" OUTDIR="$(OUTDIR)"
 
 .PHONY: portable
-portable:
+portable: setup
 	@if [[ -z "$(TARGET)" ]]; then echo "Usage: make portable TARGET=<triple>"; exit 2; fi
 	$(call ensure_target,$(TARGET))
-	@if command -v cargo-zigbuild >/dev/null 2>&1; then \
-		RUSTFLAGS="$(PORTABLE_RUSTFLAGS)" cargo zigbuild $(PROFILE_FLAG) $(COMMON_FLAGS) --target $(TARGET); \
-	else \
-		echo "cargo-zigbuild not found; trying cargo build directly for $(TARGET)"; \
-		RUSTFLAGS="$(PORTABLE_RUSTFLAGS)" cargo build $(PROFILE_FLAG) $(COMMON_FLAGS) --target $(TARGET); \
-	fi
+	@RUSTFLAGS="$(PORTABLE_RUSTFLAGS)" cargo build $(PROFILE_FLAG) $(COMMON_FLAGS) --target $(TARGET)
 	@mkdir -p $(OUTDIR)
 	@cp target/$(TARGET)/$(PROFILE)/$(BIN) $(OUTDIR)/$(BIN)-$(TARGET)
 	@echo "Built $(OUTDIR)/$(BIN)-$(TARGET)"
@@ -112,7 +193,7 @@ PKG_HOMEPAGE    ?= https://github.com/blakegolliher/nfs-top
 PKG_SECTION     ?= admin
 PKG_PRIORITY    ?= optional
 
-DEB_TARGET ?= $(HOST_MUSL_TARGET)
+DEB_TARGET ?= $(HOST_TARGET)
 
 # Map Rust target triple -> Debian architecture.
 ifneq (,$(findstring x86_64,$(DEB_TARGET)))
@@ -129,7 +210,7 @@ DEB_STAGE := $(OUTDIR)/deb/$(PKG_NAME)_$(PKG_VERSION)_$(DEB_ARCH)
 DEB_FILE  := $(OUTDIR)/$(PKG_NAME)_$(PKG_VERSION)_$(DEB_ARCH).deb
 
 .PHONY: deb
-deb:
+deb: setup-deb
 	@if [[ "$(DEB_ARCH)" == "unknown" ]]; then \
 		echo "DEB_TARGET=$(DEB_TARGET) does not map to a Debian arch (amd64|arm64|armhf)"; exit 2; \
 	fi
@@ -147,6 +228,7 @@ deb:
 	   echo "Architecture: $(DEB_ARCH)"; \
 	   echo "Maintainer: $(PKG_MAINTAINER)"; \
 	   echo "Installed-Size: $$INSTALLED_SIZE"; \
+	   echo "Depends: libc6, libelf1, zlib1g, libzstd1"; \
 	   echo "Homepage: $(PKG_HOMEPAGE)"; \
 	   echo "Description: $(PKG_DESCRIPTION)"; \
 	   echo " Linux NFS client monitor that reads /proc/self/mountstats,"; \
@@ -180,12 +262,13 @@ deb-clean:
 # ---- RPM packaging -----------------------------------------------------------
 # Produces a .rpm for installation on RHEL/Rocky/Fedora/SUSE. Uses `rpmbuild`
 # directly with a generated spec file so no extra cargo tooling is required.
-# Mirrors the .deb pipeline: build a portable musl binary, stage into a
-# BUILDROOT, then package.
+# Mirrors the .deb pipeline: build a host-arch glibc-dynamic binary, stage
+# into a BUILDROOT, then package. The binary links to libelf/zlib/glibc at
+# runtime, declared as Requires.
 
 PKG_LICENSE ?= MIT
 RPM_RELEASE ?= 1
-RPM_TARGET  ?= $(HOST_MUSL_TARGET)
+RPM_TARGET  ?= $(HOST_TARGET)
 
 # Map Rust target triple -> RPM architecture.
 ifneq (,$(findstring x86_64,$(RPM_TARGET)))
@@ -201,7 +284,7 @@ endif
 RPM_FILE := $(OUTDIR)/$(PKG_NAME)-$(PKG_VERSION)-$(RPM_RELEASE).$(RPM_ARCH).rpm
 
 .PHONY: rpm
-rpm:
+rpm: setup-rpm
 	@command -v rpmbuild >/dev/null || { echo "rpmbuild not found (install rpm-build)"; exit 2; }
 	@if [[ "$(RPM_ARCH)" == "unknown" ]]; then \
 		echo "RPM_TARGET=$(RPM_TARGET) does not map to an RPM arch (x86_64|aarch64|armv7hl)"; exit 2; \
@@ -223,7 +306,7 @@ rpm:
 	    echo "URL:        $(PKG_HOMEPAGE)"; \
 	    echo "Packager:   $(PKG_MAINTAINER)"; \
 	    echo "BuildArch:  $(RPM_ARCH)"; \
-	    echo "AutoReqProv: no"; \
+	    echo "Requires:   glibc, elfutils-libelf, zlib"; \
 	    echo "%define _build_id_links none"; \
 	    echo "%define __strip /bin/true"; \
 	    echo ""; \
